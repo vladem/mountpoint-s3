@@ -79,18 +79,22 @@ fn read_flexible_retrieval_test<F>(creator_fn: F, prefix: &str)
 where
     F: FnOnce(&str, TestSessionConfig) -> (TempDir, BackgroundSession, TestClientBox),
 {
-    const FILES: &[&str] = &["STANDARD", "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE"];
+    const FILES: &[&str] = &["STANDARD", "GLACIER_IR", "GLACIER", "DEEP_ARCHIVE", "GLACIER_RESTORED", "DEEP_ARCHIVE_RESTORED"];
 
     let (mount_point, _session, mut test_client) = creator_fn(prefix, Default::default());
 
     for file in FILES {
         let mut put_params = PutObjectParams::default();
         if *file != "STANDARD" {
-            put_params.storage_class = Some(file.to_string());
+            put_params.storage_class = Some(file.to_string().replace("_RESTORED", ""));
         }
+        let key = format!("{file}.txt");
         test_client
-            .put_object_params(&format!("{file}.txt"), b"hello world", put_params)
+            .put_object_params(&key, b"hello world", put_params)
             .unwrap();
+        if file.contains("_RESTORED") {
+            test_client.restore_object(&key).unwrap();
+        }
     }
 
     let read_dir_iter = read_dir(mount_point.path()).unwrap();

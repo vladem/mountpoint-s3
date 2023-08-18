@@ -43,6 +43,8 @@ pub trait TestClient {
     fn is_upload_in_progress(&self, key: &str) -> Result<bool, Box<dyn std::error::Error>>;
 
     fn get_object_storage_class(&self, key: &str) -> Result<Option<String>, Box<dyn std::error::Error>>;
+
+    fn restore_object(&mut self, key: &str) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 pub type TestClientBox = Box<dyn TestClient>;
@@ -164,6 +166,13 @@ mod mock_session {
             let full_key = format!("{}{}", self.prefix, key);
             self.client
                 .get_object_storage_class(&full_key)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        }
+
+        fn restore_object(&mut self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+            let full_key = format!("{}{}", self.prefix, key);
+            self.client
+                .restore_object(&full_key)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
         }
     }
