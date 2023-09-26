@@ -25,6 +25,7 @@ use mountpoint_s3_crt::common::uri::Uri;
 use nix::sys::signal::Signal;
 use nix::unistd::ForkResult;
 use regex::Regex;
+use std::os::unix::fs::MetadataExt;
 
 mod build_info;
 
@@ -264,6 +265,7 @@ fn main() -> anyhow::Result<()> {
 
     if args.foreground {
         init_logging(args.logging_config()).context("failed to initialize logging")?;
+        tracing::debug!("userid is {:?}", std::fs::metadata("/proc/self").map(|m| m.uid()));
 
         let _metrics = metrics::install();
 
@@ -389,7 +391,7 @@ fn main() -> anyhow::Result<()> {
 fn mount(args: CliArgs) -> anyhow::Result<FuseSession> {
     const DEFAULT_TARGET_THROUGHPUT: f64 = 10.0;
 
-    validate_mount_point(&args.mount_point)?;
+    // validate_mount_point(&args.mount_point)?;
 
     let bucket_description = args.bucket_description();
 
