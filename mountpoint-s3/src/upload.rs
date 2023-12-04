@@ -4,6 +4,7 @@ use mountpoint_s3_client::checksums::crc32c_from_base64;
 use mountpoint_s3_client::error::{ObjectClientError, PutObjectError};
 use mountpoint_s3_client::types::{ObjectClientResult, PutObjectParams, PutObjectResult, UploadReview};
 use mountpoint_s3_client::{ObjectClient, PutObjectRequest};
+use mountpoint_s3_client::config::ServerSideEncryption;
 
 use mountpoint_s3_crt::checksums::crc32c::{Crc32c, Hasher};
 use thiserror::Error;
@@ -80,7 +81,10 @@ impl<Client: ObjectClient> UploadRequest<Client> {
             params = params.storage_class(storage_class.clone());
         }
 
-        let request = inner.client.put_object(bucket, key, &params).await?;
+        params = params.server_side_encryption(ServerSideEncryption::DualLayerKms { key_id: Some("key_here".to_owned()) });
+
+        let request: <Client as ObjectClient>::PutObjectRequest = inner.client.put_object(bucket, key, &params).await?;
+        // todo: await until SSE header confirmed by AWS server?
         let maximum_upload_size = inner.client.part_size().map(|ps| ps * MAX_S3_MULTIPART_UPLOAD_PARTS);
 
         Ok(Self {

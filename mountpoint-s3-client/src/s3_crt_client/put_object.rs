@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use std::collections::HashMap;
 
-use crate::object_client::{ObjectClientResult, PutObjectError, PutObjectParams, PutObjectRequest, PutObjectResult};
+use crate::object_client::{ObjectClientResult, PutObjectError, PutObjectParams, PutObjectRequest, PutObjectResult, ServerSideEncryption};
 use crate::s3_crt_client::{emit_throughput_metric, S3CrtClient, S3RequestError};
 use async_trait::async_trait;
-use mountpoint_s3_crt::http::request_response::Header;
+use mountpoint_s3_crt::http::request_response::{Header, Headers};
 use mountpoint_s3_crt::io::async_stream::{self, AsyncStreamWriter};
 use mountpoint_s3_crt::s3::client::{ChecksumConfig, MetaRequestType, UploadReview};
 use tracing::error;
@@ -45,12 +46,57 @@ impl S3CrtClient {
                 .set_header(&Header::new("x-amz-storage-class", storage_class))
                 .map_err(S3RequestError::construction_failure)?;
         }
-
+        let mut maybe_sse = None;
+        let mut maybe_key_id = None;
+        match params.server_side_encryption.to_owned() {
+            ServerSideEncryption::Default => (),
+            ServerSideEncryption::Kms { key_id } => {
+                maybe_sse = Some("aws:kms");
+                maybe_key_id = key_id;
+            },
+            ServerSideEncryption::DualLayerKms { key_id } => {
+                maybe_sse = Some("aws:kms:dsse");
+                maybe_key_id = key_id;
+            }
+        }
+        let mut checked_headers = HashMap::new();
+        if let Some(sse) = maybe_sse {
+            let header_name = "x-amz-server-side-encryption";
+            checked_headers.insert(header_name.to_owned(), sse.to_owned());
+            message
+                .set_header(&Header::new(header_name, sse))
+                .map_err(S3RequestError::construction_failure)?;
+        }
+        if let Some(key_id) = maybe_key_id {
+            let header_name = "x-amz-server-side-encryption-aws-kms-key-id";
+            checked_headers.insert(header_name.to_owned(), key_id.clone());
+            message
+                .set_header(&Header::new(header_name, key_id))
+                .map_err(S3RequestError::construction_failure)?;
+        }
+        let on_headers = move |headers: &Headers, _: i32| {
+            let mut matched = 0;
+            headers.iter().for_each(|(name, value)| {
+                println!("put header: {}:{}", name.to_str().unwrap(), value.to_str().unwrap()); // todo: remove
+                match checked_headers.get(name.to_str().unwrap()) {
+                    Some(expected_value) => {
+                        if expected_value == value.to_str().unwrap() {
+                            matched += 1;
+                        }
+                    },
+                    None => ()
+                }
+            });
+            if matched != checked_headers.len() {
+                panic!("headers mismatch"); // todo: instead, send confirmation to the caller via channel
+                // todo: what if this request failed for some other reason?
+            }
+        };
         let mut options = S3CrtClientInner::new_meta_request_options(message, MetaRequestType::PutObject);
         options.on_upload_review(move |review| callback.invoke(review));
         let body = self
             .inner
-            .make_simple_http_request_from_options(options, span, |_| None)?;
+            .make_simple_http_request_from_options(options, span, |_| None, on_headers)?;
 
         Ok(S3PutObjectRequest {
             body,
