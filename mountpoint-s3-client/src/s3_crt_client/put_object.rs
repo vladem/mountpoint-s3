@@ -1,6 +1,6 @@
+use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use std::collections::HashMap;
 
 use crate::object_client::{ObjectClientResult, PutObjectError, PutObjectParams, PutObjectRequest, PutObjectResult, ServerSideEncryption};
 use crate::s3_crt_client::{emit_throughput_metric, S3CrtClient, S3RequestError};
@@ -59,38 +59,33 @@ impl S3CrtClient {
                 maybe_key_id = key_id;
             }
         }
-        let mut checked_headers = HashMap::new();
+        let mut checked_headers = Vec::new();
         if let Some(sse) = maybe_sse {
             let header_name = "x-amz-server-side-encryption";
-            checked_headers.insert(header_name.to_owned(), sse.to_owned());
+            checked_headers.push((header_name.to_owned(), sse.to_owned()));
             message
                 .set_header(&Header::new(header_name, sse))
                 .map_err(S3RequestError::construction_failure)?;
         }
         if let Some(key_id) = maybe_key_id {
             let header_name = "x-amz-server-side-encryption-aws-kms-key-id";
-            checked_headers.insert(header_name.to_owned(), key_id.clone());
+            checked_headers.push((header_name.to_owned(), key_id.clone()));
             message
                 .set_header(&Header::new(header_name, key_id))
                 .map_err(S3RequestError::construction_failure)?;
         }
         let on_headers = move |headers: &Headers, _: i32| {
-            let mut matched = 0;
-            headers.iter().for_each(|(name, value)| {
-                println!("put header: {}:{}", name.to_str().unwrap(), value.to_str().unwrap()); // todo: remove
-                match checked_headers.get(name.to_str().unwrap()) {
-                    Some(expected_value) => {
-                        if expected_value == value.to_str().unwrap() {
-                            matched += 1;
-                        }
-                    },
-                    None => ()
+            checked_headers.iter().for_each(|(expected_name, expected_value)| {
+                let found = headers.iter().find(|(actual_name, actual_value)| {
+                    *actual_name == OsString::from(expected_name) && *actual_value == OsString::from(expected_value)});
+                if found == None {
+                    let serialized_headers = headers.iter().map(|(name, value)|
+                        name.to_str().unwrap_or("").to_owned() + "=" + value.to_str().unwrap_or("")
+                    ).collect::<Vec<String>>().join(", ");
+                    panic!("header {}={} not found in MultiPartUpload response headers: {}", expected_name, expected_value, serialized_headers);
                 }
             });
-            if matched != checked_headers.len() {
-                panic!("headers mismatch"); // todo: instead, send confirmation to the caller via channel
-                // todo: what if this request failed for some other reason?
-            }
+            // todo: what if this request failed for some other reason? it makes no sense to panic in that case
         };
         let mut options = S3CrtClientInner::new_meta_request_options(message, MetaRequestType::PutObject);
         options.on_upload_review(move |review| callback.invoke(review));
