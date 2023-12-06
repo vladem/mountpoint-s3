@@ -4,7 +4,6 @@ use mountpoint_s3_client::checksums::crc32c_from_base64;
 use mountpoint_s3_client::error::{ObjectClientError, PutObjectError};
 use mountpoint_s3_client::types::{ObjectClientResult, PutObjectParams, PutObjectResult, UploadReview};
 use mountpoint_s3_client::{ObjectClient, PutObjectRequest};
-use mountpoint_s3_client::config::ServerSideEncryption;
 
 use mountpoint_s3_crt::checksums::crc32c::{Crc32c, Hasher};
 use thiserror::Error;
@@ -26,13 +25,12 @@ pub struct Uploader<Client> {
 struct UploaderInner<Client> {
     client: Arc<Client>,
     storage_class: Option<String>,
-    server_side_encryption: ServerSideEncryption,
 }
 
 impl<Client: ObjectClient> Uploader<Client> {
     /// Create a new [Uploader] that will make requests to the given client.
-    pub fn new(client: Arc<Client>, storage_class: Option<String>, server_side_encryption: ServerSideEncryption) -> Self {
-        let inner = UploaderInner { client, storage_class, server_side_encryption };
+    pub fn new(client: Arc<Client>, storage_class: Option<String>) -> Self {
+        let inner = UploaderInner { client, storage_class };
         Self { inner: Arc::new(inner) }
     }
 
@@ -81,7 +79,6 @@ impl<Client: ObjectClient> UploadRequest<Client> {
         if let Some(storage_class) = &inner.storage_class {
             params = params.storage_class(storage_class.clone());
         }
-        params = params.server_side_encryption(inner.server_side_encryption.clone());
 
         let request: <Client as ObjectClient>::PutObjectRequest = inner.client.put_object(bucket, key, &params).await?;
         // todo: await until SSE header confirmed by AWS server?

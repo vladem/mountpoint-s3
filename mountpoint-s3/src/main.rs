@@ -564,11 +564,18 @@ fn mount(args: CliArgs) -> anyhow::Result<FuseSession> {
         }
     }
 
+    let mut server_side_encryption = args.server_side_encryption.0;
+    match server_side_encryption {
+        ServerSideEncryption::Default => (),
+        ServerSideEncryption::Kms { ref mut key_id } => *key_id = args.sse_kms_key_id,
+        ServerSideEncryption::DualLayerKms { ref mut key_id } => *key_id = args.sse_kms_key_id,
+    }
     let mut client_config = S3ClientConfig::new()
         .auth_config(auth_config)
         .throughput_target_gbps(throughput_target_gbps)
         .part_size(args.part_size as usize)
-        .user_agent(user_agent);
+        .user_agent(user_agent)
+        .server_side_encryption(server_side_encryption);
     if args.requester_pays {
         client_config = client_config.request_payer("requester");
     }
@@ -608,12 +615,6 @@ fn mount(args: CliArgs) -> anyhow::Result<FuseSession> {
     filesystem_config.allow_delete = args.allow_delete;
     filesystem_config.s3_personality =
         get_s3_personality(args.bucket_type, &args.bucket_name, client.endpoint_config());
-    filesystem_config.server_side_encryption = args.server_side_encryption.0;
-    match filesystem_config.server_side_encryption {
-        ServerSideEncryption::Default => (),
-        ServerSideEncryption::Kms { ref mut key_id } => *key_id = args.sse_kms_key_id,
-        ServerSideEncryption::DualLayerKms { ref mut key_id } => *key_id = args.sse_kms_key_id,
-    }
 
     let prefetcher_config = Default::default();
 

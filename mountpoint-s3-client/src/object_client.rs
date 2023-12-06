@@ -290,8 +290,6 @@ pub struct PutObjectParams {
     pub trailing_checksums: bool,
     /// Storage class to be used when creating new S3 object
     pub storage_class: Option<String>,
-    /// Server side encryption configuration to be used when creating new S3 object
-    pub server_side_encryption: ServerSideEncryption
 }
 
 impl PutObjectParams {
@@ -309,12 +307,6 @@ impl PutObjectParams {
     /// Set the storage class.
     pub fn storage_class(mut self, value: String) -> Self {
         self.storage_class = Some(value);
-        self
-    }
-
-    /// Set server side encryption configuration.
-    pub fn server_side_encryption(mut self, value: ServerSideEncryption) -> Self {
-        self.server_side_encryption = value;
         self
     }
 }

@@ -47,6 +47,10 @@ pub fn get_test_bucket() -> String {
     }
 }
 
+pub fn get_test_kms_key_id() -> Option<String> {
+    std::env::var("KMS_TEST_KEY_ID").ok()
+}
+
 pub fn get_test_client() -> S3CrtClient {
     let endpoint_config = EndpointConfig::new(&get_test_region());
     S3CrtClient::new(S3ClientConfig::new().endpoint_config(endpoint_config)).expect("could not create test client")

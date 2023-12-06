@@ -330,3 +330,33 @@ async fn test_put_object_storage_class(storage_class: &str) {
 
     assert_eq!(storage_class, attributes.storage_class.unwrap().as_str());
 }
+
+#[tokio::test]
+async fn test_put_object_sse() {
+    let sse_key = get_test_kms_key_id();
+    let (bucket, prefix) = get_test_bucket_and_prefix("test_put_object_sse");
+    let client_config = S3ClientConfig::new()
+        .endpoint_config(EndpointConfig::new(&get_test_region()))
+        .server_side_encryption(mountpoint_s3_client::config::ServerSideEncryption::DualLayerKms { key_id: sse_key.clone() });
+    let client = S3CrtClient::new(client_config).expect("could not create test client");
+    let key = format!("{prefix}hello");
+
+    let mut contents = vec![0u8; 32];
+    let mut rng = rand::thread_rng();
+    rng.fill(&mut contents[..]);
+    let mut request = client
+        .put_object(&bucket, &key, &Default::default())
+        .await
+        .expect("put_object should succeed");
+    request.write(&contents).await.unwrap();
+    request.complete().await.unwrap();
+
+    let sdk_client = get_test_sdk_client().await;
+    let mut request = sdk_client.head_object();
+    if cfg!(not(feature = "s3express_tests")) {
+        request = request.bucket(&bucket);
+    }
+    let head_object_resp: aws_sdk_s3::operation::head_object::HeadObjectOutput = request.key(&key).send().await.expect("head object should succeed");
+    assert_eq!(head_object_resp.server_side_encryption, Some(aws_sdk_s3::types::ServerSideEncryption::AwsKmsDsse), "unexpected sse type");
+    assert_eq!(head_object_resp.ssekms_key_id, sse_key, "unexpected sse type");
+}

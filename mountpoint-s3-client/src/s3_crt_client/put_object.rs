@@ -48,7 +48,7 @@ impl S3CrtClient {
         }
         let mut maybe_sse = None;
         let mut maybe_key_id = None;
-        match params.server_side_encryption.to_owned() {
+        match self.inner.server_side_encryption.to_owned() {
             ServerSideEncryption::Default => (),
             ServerSideEncryption::Kms { key_id } => {
                 maybe_sse = Some("aws:kms");
@@ -82,10 +82,10 @@ impl S3CrtClient {
                     let serialized_headers = headers.iter().map(|(name, value)|
                         name.to_str().unwrap_or("").to_owned() + "=" + value.to_str().unwrap_or("")
                     ).collect::<Vec<String>>().join(", ");
-                    panic!("header {}={} not found in MultiPartUpload response headers: {}", expected_name, expected_value, serialized_headers);
+                    // todo: what should we do here? we can not panic if this request failed for some other reason
+                    println!("header {}={} not found in MultiPartUpload response headers: {}", expected_name, expected_value, serialized_headers);
                 }
             });
-            // todo: what if this request failed for some other reason? it makes no sense to panic in that case
         };
         let mut options = S3CrtClientInner::new_meta_request_options(message, MetaRequestType::PutObject);
         options.on_upload_review(move |review| callback.invoke(review));
