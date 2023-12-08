@@ -59,33 +59,25 @@ impl S3CrtClient {
                 maybe_key_id = key_id;
             }
         }
-        let mut checked_headers = Vec::new();
+        let mut expected_headers = Vec::new();
         if let Some(sse) = maybe_sse {
             let header_name = "x-amz-server-side-encryption";
-            checked_headers.push((header_name.to_owned(), sse.to_owned()));
+            expected_headers.push((header_name.to_owned(), sse.to_owned()));
             message
                 .set_header(&Header::new(header_name, sse))
                 .map_err(S3RequestError::construction_failure)?;
         }
         if let Some(key_id) = maybe_key_id {
             let header_name = "x-amz-server-side-encryption-aws-kms-key-id";
-            checked_headers.push((header_name.to_owned(), key_id.clone()));
+            expected_headers.push((header_name.to_owned(), key_id.clone()));
             message
                 .set_header(&Header::new(header_name, key_id))
                 .map_err(S3RequestError::construction_failure)?;
         }
+        let response_headers: Arc<Mutex<Option<Headers>>> = Default::default();
+        let response_headers_writer = response_headers.clone();
         let on_headers = move |headers: &Headers, _: i32| {
-            checked_headers.iter().for_each(|(expected_name, expected_value)| {
-                let found = headers.iter().find(|(actual_name, actual_value)| {
-                    *actual_name == OsString::from(expected_name) && *actual_value == OsString::from(expected_value)});
-                if found == None {
-                    let serialized_headers = headers.iter().map(|(name, value)|
-                        name.to_str().unwrap_or("").to_owned() + "=" + value.to_str().unwrap_or("")
-                    ).collect::<Vec<String>>().join(", ");
-                    // todo: what should we do here? we can not panic if this request failed for some other reason
-                    println!("header {}={} not found in MultiPartUpload response headers: {}", expected_name, expected_value, serialized_headers);
-                }
-            });
+            *response_headers_writer.lock().unwrap() = Some(headers.clone());
         };
         let mut options = S3CrtClientInner::new_meta_request_options(message, MetaRequestType::PutObject);
         options.on_upload_review(move |review| callback.invoke(review));
@@ -99,6 +91,8 @@ impl S3CrtClient {
             review_callback,
             start_time: Instant::now(),
             total_bytes: 0,
+            response_headers: response_headers,
+            expected_headers: expected_headers,
         })
     }
 }
@@ -147,6 +141,28 @@ pub struct S3PutObjectRequest {
     review_callback: ReviewCallbackBox,
     start_time: Instant,
     total_bytes: u64,
+    response_headers: Arc<Mutex<Option<Headers>>>,
+    expected_headers: Vec<(String, String)>,
+}
+
+fn check_response_headers(response_headers: Arc<Mutex<Option<Headers>>>, expected_headers: &Vec<(String, String)>) -> Result<(), S3RequestError> {
+    let mut missing = Vec::new();
+    for (expected_name, expected_value) in expected_headers.iter() {
+        let found = response_headers
+            .lock()
+            .expect("must be able to acquire heeaders lock")
+            .as_ref()
+            .expect("PUT response headers must be available at this point")
+            .get(expected_name);
+        if found.is_err() || found.unwrap().value().to_str().unwrap_or("") != expected_value {
+            missing.push(expected_name.clone());
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(S3RequestError::Forbidden(format!("PUT response headers {:?} are missing or have an unexpacted value", missing)))
+    }
 }
 
 #[cfg_attr(not(docs_rs), async_trait)]
@@ -183,6 +199,7 @@ impl PutObjectRequest for S3PutObjectRequest {
         let elapsed = self.start_time.elapsed();
         emit_throughput_metric(self.total_bytes, elapsed, "put_object");
 
+        check_response_headers(self.response_headers, &self.expected_headers)?;
         result.map(|_| PutObjectResult {})
     }
 }

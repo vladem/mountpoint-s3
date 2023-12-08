@@ -81,7 +81,6 @@ impl<Client: ObjectClient> UploadRequest<Client> {
         }
 
         let request: <Client as ObjectClient>::PutObjectRequest = inner.client.put_object(bucket, key, &params).await?;
-        // todo: await until SSE header confirmed by AWS server?
         let maximum_upload_size = inner.client.part_size().map(|ps| ps * MAX_S3_MULTIPART_UPLOAD_PARTS);
 
         Ok(Self {
