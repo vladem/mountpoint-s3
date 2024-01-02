@@ -1,8 +1,9 @@
-use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::object_client::{ObjectClientResult, PutObjectError, PutObjectParams, PutObjectRequest, PutObjectResult, ServerSideEncryption};
+use crate::object_client::{
+    ObjectClientResult, PutObjectError, PutObjectParams, PutObjectRequest, PutObjectResult, ServerSideEncryption,
+};
 use crate::s3_crt_client::{emit_throughput_metric, S3CrtClient, S3RequestError};
 use async_trait::async_trait;
 use mountpoint_s3_crt::http::request_response::{Header, Headers};
@@ -48,12 +49,12 @@ impl S3CrtClient {
         }
         let mut maybe_sse = None;
         let mut maybe_key_id = None;
-        match self.inner.server_side_encryption.to_owned() {
+        match params.server_side_encryption.to_owned() {
             ServerSideEncryption::Default => (),
             ServerSideEncryption::Kms { key_id } => {
                 maybe_sse = Some("aws:kms");
                 maybe_key_id = key_id;
-            },
+            }
             ServerSideEncryption::DualLayerKms { key_id } => {
                 maybe_sse = Some("aws:kms:dsse");
                 maybe_key_id = key_id;
@@ -145,7 +146,10 @@ pub struct S3PutObjectRequest {
     expected_headers: Vec<(String, String)>,
 }
 
-fn check_response_headers(response_headers: Arc<Mutex<Option<Headers>>>, expected_headers: &Vec<(String, String)>) -> Result<(), S3RequestError> {
+fn check_response_headers(
+    response_headers: Arc<Mutex<Option<Headers>>>,
+    expected_headers: &Vec<(String, String)>,
+) -> Result<(), S3RequestError> {
     let mut missing = Vec::new();
     for (expected_name, expected_value) in expected_headers.iter() {
         let found = response_headers
@@ -161,7 +165,10 @@ fn check_response_headers(response_headers: Arc<Mutex<Option<Headers>>>, expecte
     if missing.is_empty() {
         Ok(())
     } else {
-        Err(S3RequestError::Forbidden(format!("PUT response headers {:?} are missing or have an unexpacted value", missing)))
+        Err(S3RequestError::Forbidden(format!(
+            "PUT response headers {:?} are missing or have an unexpacted value",
+            missing
+        )))
     }
 }
 

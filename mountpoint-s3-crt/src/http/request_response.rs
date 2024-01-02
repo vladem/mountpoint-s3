@@ -210,9 +210,7 @@ impl Clone for Headers {
     fn clone(&self) -> Self {
         // SAFETY: `self.inner` is a valid `aws_http_headers`, and on Clone it's safe and required to increment
         // the reference count, dropping new Headers object will decrement it
-        unsafe {
-            Headers::from_crt(self.inner)
-        }
+        unsafe { Headers::from_crt(self.inner) }
     }
 }
 

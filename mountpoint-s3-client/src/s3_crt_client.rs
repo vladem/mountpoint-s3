@@ -87,8 +87,6 @@ pub struct S3ClientConfig {
     user_agent: Option<UserAgent>,
     request_payer: Option<String>,
     bucket_owner: Option<String>,
-    /// Server side encryption configuration to be used when creating new S3 object
-    server_side_encryption: ServerSideEncryption,
 }
 
 impl Default for S3ClientConfig {
@@ -101,7 +99,6 @@ impl Default for S3ClientConfig {
             user_agent: None,
             request_payer: None,
             bucket_owner: None,
-            server_side_encryption: ServerSideEncryption::Default,
         }
     }
 }
@@ -157,13 +154,6 @@ impl S3ClientConfig {
     #[must_use = "S3ClientConfig follows a builder pattern"]
     pub fn bucket_owner(mut self, bucket_owner: &str) -> Self {
         self.bucket_owner = Some(bucket_owner.to_owned());
-        self
-    }
-
-    /// Set a server side encryption settings value
-    #[must_use = "S3ClientConfig follows a builder pattern"]
-    pub fn server_side_encryption(mut self, server_side_encryption: ServerSideEncryption) -> Self {
-        self.server_side_encryption = server_side_encryption;
         self
     }
 }
@@ -229,7 +219,6 @@ struct S3CrtClientInner {
     part_size: usize,
     bucket_owner: Option<String>,
     credentials_provider: Option<CredentialsProvider>,
-    server_side_encryption: ServerSideEncryption,
 }
 
 impl S3CrtClientInner {
@@ -325,7 +314,6 @@ impl S3CrtClientInner {
             part_size: config.part_size,
             bucket_owner: config.bucket_owner,
             credentials_provider: Some(credentials_provider),
-            server_side_encryption: config.server_side_encryption,
         })
     }
 
@@ -582,7 +570,7 @@ impl S3CrtClientInner {
         on_error: impl FnOnce(&MetaRequestResult) -> Option<E> + Send + 'static,
     ) -> Result<S3HttpRequest<Vec<u8>, E>, S3RequestError> {
         let options = Self::new_meta_request_options(message, request_type);
-        self.make_simple_http_request_from_options(options, request_span, on_error, |_,_|())
+        self.make_simple_http_request_from_options(options, request_span, on_error, |_, _| ())
     }
 
     /// Make an HTTP request using this S3 client that returns the body on success or invokes the

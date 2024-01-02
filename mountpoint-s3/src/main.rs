@@ -17,7 +17,9 @@ use mountpoint_s3::logging::{init_logging, LoggingConfig};
 use mountpoint_s3::prefetch::{caching_prefetch, default_prefetch, Prefetch};
 use mountpoint_s3::prefix::Prefix;
 use mountpoint_s3::{autoconfigure, metrics};
-use mountpoint_s3_client::config::{AddressingStyle, EndpointConfig, S3ClientAuthConfig, S3ClientConfig, ServerSideEncryption};
+use mountpoint_s3_client::config::{
+    AddressingStyle, EndpointConfig, S3ClientAuthConfig, S3ClientConfig, ServerSideEncryption,
+};
 use mountpoint_s3_client::error::ObjectClientError;
 use mountpoint_s3_client::instance_info::InstanceInfo;
 use mountpoint_s3_client::user_agent::UserAgent;
@@ -297,7 +299,11 @@ struct ServerSideEncryptionArg(ServerSideEncryption);
 
 impl ValueEnum for ServerSideEncryptionArg {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self(ServerSideEncryption::Default), Self(ServerSideEncryption::Kms { key_id: None }), Self(ServerSideEncryption::DualLayerKms { key_id: None })]
+        &[
+            Self(ServerSideEncryption::Default),
+            Self(ServerSideEncryption::Kms { key_id: None }),
+            Self(ServerSideEncryption::DualLayerKms { key_id: None }),
+        ]
     }
 
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
@@ -564,18 +570,11 @@ fn mount(args: CliArgs) -> anyhow::Result<FuseSession> {
         }
     }
 
-    let mut server_side_encryption = args.server_side_encryption.0;
-    match server_side_encryption {
-        ServerSideEncryption::Default => (),
-        ServerSideEncryption::Kms { ref mut key_id } => *key_id = args.sse_kms_key_id,
-        ServerSideEncryption::DualLayerKms { ref mut key_id } => *key_id = args.sse_kms_key_id,
-    }
     let mut client_config = S3ClientConfig::new()
         .auth_config(auth_config)
         .throughput_target_gbps(throughput_target_gbps)
         .part_size(args.part_size as usize)
-        .user_agent(user_agent)
-        .server_side_encryption(server_side_encryption);
+        .user_agent(user_agent);
     if args.requester_pays {
         client_config = client_config.request_payer("requester");
     }
@@ -616,6 +615,12 @@ fn mount(args: CliArgs) -> anyhow::Result<FuseSession> {
     filesystem_config.s3_personality =
         get_s3_personality(args.bucket_type, &args.bucket_name, client.endpoint_config());
 
+    filesystem_config.server_side_encryption = args.server_side_encryption.0;
+    match filesystem_config.server_side_encryption {
+        ServerSideEncryption::Default => (),
+        ServerSideEncryption::Kms { ref mut key_id } => *key_id = args.sse_kms_key_id,
+        ServerSideEncryption::DualLayerKms { ref mut key_id } => *key_id = args.sse_kms_key_id,
+    }
     let prefetcher_config = Default::default();
 
     if let Some(path) = args.cache {
