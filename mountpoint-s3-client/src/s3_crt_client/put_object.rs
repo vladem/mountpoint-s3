@@ -156,7 +156,7 @@ fn check_response_headers(
             .lock()
             .expect("must be able to acquire heeaders lock")
             .as_ref()
-            .expect("PUT response headers must be available at this point")
+            .expect("PUT response headers must be available at this point") // TODO: this is an assumption, how to check this?
             .get(expected_name);
         if found.is_err() || found.unwrap().value().to_str().unwrap_or("") != expected_value {
             missing.push(expected_name.clone());

@@ -5,7 +5,7 @@ pub mod common;
 use common::*;
 use futures::{pin_mut, StreamExt};
 use mountpoint_s3_client::checksums::crc32c_to_base64;
-use mountpoint_s3_client::config::{EndpointConfig, S3ClientConfig};
+use mountpoint_s3_client::config::{EndpointConfig, S3ClientConfig, ServerSideEncryption};
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::{ObjectClientResult, PutObjectParams};
 use mountpoint_s3_client::{ObjectClient, PutObjectRequest, S3CrtClient, S3RequestError};
@@ -331,9 +331,13 @@ async fn test_put_object_storage_class(storage_class: &str) {
     assert_eq!(storage_class, attributes.storage_class.unwrap().as_str());
 }
 
+#[test_case(ServerSideEncryption::DualLayerKms{ key_id: get_test_kms_key_id() })]
+#[test_case(ServerSideEncryption::DualLayerKms{ key_id: None })]
+#[test_case(ServerSideEncryption::Kms{ key_id: get_test_kms_key_id() })]
+#[test_case(ServerSideEncryption::Kms{ key_id: None })]
+#[test_case(ServerSideEncryption::Default)]
 #[tokio::test]
-async fn test_put_object_sse() {
-    let sse_key = get_test_kms_key_id();
+async fn test_put_object_sse(sse: ServerSideEncryption) {
     let (bucket, prefix) = get_test_bucket_and_prefix("test_put_object_sse");
     let client_config = S3ClientConfig::new().endpoint_config(EndpointConfig::new(&get_test_region()));
     let client = S3CrtClient::new(client_config).expect("could not create test client");
@@ -342,11 +346,7 @@ async fn test_put_object_sse() {
     let mut contents = vec![0u8; 32];
     let mut rng = rand::thread_rng();
     rng.fill(&mut contents[..]);
-    let params = PutObjectParams::new().server_side_encryption(
-        mountpoint_s3_client::config::ServerSideEncryption::DualLayerKms {
-            key_id: sse_key.clone(),
-        },
-    );
+    let params = PutObjectParams::new().server_side_encryption(sse.clone());
     let mut request = client
         .put_object(&bucket, &key, &params)
         .await
@@ -361,10 +361,29 @@ async fn test_put_object_sse() {
     }
     let head_object_resp: aws_sdk_s3::operation::head_object::HeadObjectOutput =
         request.key(&key).send().await.expect("head object should succeed");
+    let mut expected_sse = None;
+    let mut expected_key = None;
+    match sse.clone() {
+        ServerSideEncryption::Default => expected_sse = Some(aws_sdk_s3::types::ServerSideEncryption::Aes256),
+        ServerSideEncryption::Kms { key_id } => {
+            expected_sse = Some(aws_sdk_s3::types::ServerSideEncryption::AwsKms);
+            expected_key = key_id;
+        }
+        ServerSideEncryption::DualLayerKms { key_id } => {
+            expected_sse = Some(aws_sdk_s3::types::ServerSideEncryption::AwsKmsDsse);
+            expected_key = key_id;
+        }
+    };
     assert_eq!(
-        head_object_resp.server_side_encryption,
-        Some(aws_sdk_s3::types::ServerSideEncryption::AwsKmsDsse),
+        head_object_resp.server_side_encryption, expected_sse,
         "unexpected sse type"
     );
-    assert_eq!(head_object_resp.ssekms_key_id, sse_key, "unexpected sse type");
+    assert!(
+        head_object_resp.ssekms_key_id.is_some() || matches!(sse, ServerSideEncryption::Default),
+        "must have a key for non-default ecnryption methods"
+    );
+    if expected_key.is_some() {
+        // do not check the value of AWS managed key
+        assert_eq!(head_object_resp.ssekms_key_id, expected_key, "unexpected sse key")
+    }
 }
