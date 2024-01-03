@@ -388,3 +388,31 @@ async fn test_put_object_sse(input_sse: ServerSideEncryption) {
     test_put_object_large(&client, &bucket, &key, request_params.clone()).await;
     check_sse(&bucket, &key, &input_sse).await;
 }
+
+// The test sets `S3PutObjectRequest::expected_headers` to a knowingly unexpected values and checks that program panics
+// in case when actual SSE settings returned by S3 are different from expected.
+#[tokio::test]
+#[should_panic(expected = "PUT response headers [\\\"x-amz-server-side-encryption-aws-kms-key-id\\\"] are missing or have an unexpacted value")]
+async fn test_put_object_sse_unexpected_headers() {
+    let input_sse = ServerSideEncryption::Kms{ key_id: get_test_kms_key_id() };
+    let bucket = get_test_bucket();
+    let client_config = S3ClientConfig::new().endpoint_config(EndpointConfig::new(&get_test_region()));
+    let client = S3CrtClient::new(client_config).expect("could not create test client");
+    let request_params = PutObjectParams::new().server_side_encryption(input_sse.clone());
+
+    let prefix = get_unique_test_prefix("test_put_object_sse_unexpected_headers");
+    let key = format!("{prefix}hello");
+    let mut rng = rand::thread_rng();
+
+    let mut contents = vec![0u8; 32];
+    rng.fill(&mut contents[..]);
+
+    let mut request = client
+        .put_object(&bucket, &key, &request_params)
+        .await
+        .expect("put_object should succeed");
+
+    request.write(&contents).await.unwrap();
+    request.expected_headers = vec![("x-amz-server-side-encryption".to_owned(), "aws:kms".to_owned()), ("x-amz-server-side-encryption-aws-kms-key-id".to_owned(), "some_other_key_id".to_owned())];
+    request.complete().await.unwrap();
+}

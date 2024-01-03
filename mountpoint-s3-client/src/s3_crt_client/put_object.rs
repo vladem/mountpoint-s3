@@ -143,7 +143,7 @@ pub struct S3PutObjectRequest {
     start_time: Instant,
     total_bytes: u64,
     response_headers: Arc<Mutex<Option<Headers>>>,
-    expected_headers: Vec<(String, String)>,
+    pub expected_headers: Vec<(String, String)>,
 }
 
 fn check_response_headers(
