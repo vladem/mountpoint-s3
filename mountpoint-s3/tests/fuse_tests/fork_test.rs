@@ -2,11 +2,11 @@
 #![cfg(feature = "s3_tests")]
 
 use assert_cmd::prelude::*;
-#[cfg(feature = "sse-kms")]
+#[cfg(feature = "sse_kms")]
 use aws_sdk_s3::config::Credentials;
 #[cfg(not(feature = "s3express_tests"))]
 use aws_sdk_sts::config::Region;
-#[cfg(feature = "sse-kms")]
+#[cfg(feature = "sse_kms")]
 use regex::Regex;
 
 use std::fs::{self, File};
@@ -21,9 +21,9 @@ use crate::common::s3::get_subsession_iam_role;
 use crate::common::s3::{
     create_objects, get_test_bucket_and_prefix, get_test_bucket_forbidden, get_test_region, tokio_block_on,
 };
-#[cfg(feature = "sse-kms")]
+#[cfg(feature = "sse_kms")]
 use crate::common::{fuse, get_scoped_down_credentials, s3::get_test_kms_key_id};
-#[cfg(feature = "sse-kms")]
+#[cfg(feature = "sse_kms")]
 use mountpoint_s3_client::config::ServerSideEncryption;
 
 const MAX_WAIT_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
@@ -548,7 +548,7 @@ fn get_mount_from_source_and_mountpoint(source: &str, mount_point: &str) -> Opti
     None
 }
 
-#[cfg(feature = "sse-kms")]
+#[cfg(feature = "sse_kms")]
 fn mount_and_check_log<F: FnOnce(&Path)>(
     bucket: &str,
     prefix: &str,
@@ -608,7 +608,7 @@ fn erroneous_write(mount_point: &Path) {
     );
 }
 
-#[cfg(feature = "sse-kms")]
+#[cfg(feature = "sse_kms")]
 #[test]
 fn write_with_inexistent_key() {
     let expected_log_line =
@@ -625,7 +625,7 @@ fn write_with_inexistent_key() {
     );
 }
 
-#[cfg(feature = "sse-kms")]
+#[cfg(feature = "sse_kms")]
 #[test]
 fn write_with_no_permissions_for_a_key() {
     let sse_key = get_test_kms_key_id();
@@ -647,7 +647,7 @@ fn write_with_no_permissions_for_a_key() {
     );
 }
 
-#[cfg(feature = "sse-kms")]
+#[cfg(feature = "sse_kms")]
 #[test]
 fn read_with_no_permissions_for_a_key() {
     // create file
