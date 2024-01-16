@@ -2,31 +2,59 @@
 #![cfg(feature = "s3_tests")]
 
 use assert_cmd::prelude::*;
-#[cfg(feature = "sse_kms")]
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
 use aws_sdk_s3::config::Credentials;
 #[cfg(not(feature = "s3express_tests"))]
 use aws_sdk_sts::config::Region;
-#[cfg(feature = "sse_kms")]
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
 use regex::Regex;
 
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::{self};
+use std::io::{BufRead, BufReader};
 use std::process::Stdio;
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
+use std::{fs::File, io::Read, io::Write};
 use std::{path::Path, path::PathBuf, process::Command};
 use test_case::test_case;
 
 use crate::common::fuse::read_dir_to_entry_names;
 #[cfg(not(feature = "s3express_tests"))]
 use crate::common::s3::get_subsession_iam_role;
-use crate::common::s3::{
-    create_objects, get_test_bucket_and_prefix, get_test_bucket_forbidden, get_test_region, tokio_block_on,
-};
-#[cfg(feature = "sse_kms")]
-use crate::common::{fuse, get_scoped_down_credentials, s3::get_test_kms_key_id};
-#[cfg(feature = "sse_kms")]
+use crate::common::s3::{create_objects, get_test_bucket_and_prefix, get_test_bucket_forbidden, get_test_region};
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
+use crate::common::{fuse, get_scoped_down_credentials, s3::get_test_kms_key_id, s3::tokio_block_on};
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
 use mountpoint_s3_client::config::ServerSideEncryption;
 
 const MAX_WAIT_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn wait_for_child_to_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let st = std::time::Instant::now();
+
+    loop {
+        if st.elapsed() > MAX_WAIT_DURATION {
+            panic!("wait for result timeout")
+        }
+        match child.try_wait().expect("unable to wait for result") {
+            Some(result) => break result,
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+}
+
+fn wait_for_a_mount(mount_point: &Path) {
+    let st = std::time::Instant::now();
+
+    loop {
+        if st.elapsed() > MAX_WAIT_DURATION {
+            panic!("wait for result timeout")
+        }
+        if mount_exists("mountpoint-s3", mount_point.to_str().unwrap()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
 
 #[test]
 fn run_in_background() -> Result<(), Box<dyn std::error::Error>> {
@@ -44,17 +72,7 @@ fn run_in_background() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()
         .expect("unable to spawn child");
 
-    let st = std::time::Instant::now();
-
-    let exit_status = loop {
-        if st.elapsed() > MAX_WAIT_DURATION {
-            panic!("wait for result timeout")
-        }
-        match child.try_wait().expect("unable to wait for result") {
-            Some(result) => break result,
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    };
+    let exit_status = wait_for_child_to_exit(&mut child);
 
     // verify mount status and mount entry
     assert!(exit_status.success());
@@ -81,17 +99,7 @@ fn run_in_background_region_from_env() -> Result<(), Box<dyn std::error::Error>>
         .spawn()
         .expect("unable to spawn child");
 
-    let st = std::time::Instant::now();
-
-    let exit_status = loop {
-        if st.elapsed() > MAX_WAIT_DURATION {
-            panic!("wait for result timeout")
-        }
-        match child.try_wait().expect("unable to wait for result") {
-            Some(result) => break result,
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    };
+    let exit_status = wait_for_child_to_exit(&mut child);
 
     // verify mount status and mount entry
     assert!(exit_status.success());
@@ -119,17 +127,7 @@ fn run_in_background_automatic_region_resolution() -> Result<(), Box<dyn std::er
         .spawn()
         .expect("unable to spawn child");
 
-    let st = std::time::Instant::now();
-
-    let exit_status = loop {
-        if st.elapsed() > MAX_WAIT_DURATION {
-            panic!("wait for result timeout")
-        }
-        match child.try_wait().expect("unable to wait for result") {
-            Some(result) => break result,
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    };
+    let exit_status = wait_for_child_to_exit(&mut child);
 
     // verify mount status and mount entry
     assert!(exit_status.success());
@@ -157,17 +155,7 @@ fn run_in_foreground() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()
         .expect("unable to spawn child");
 
-    let st = std::time::Instant::now();
-
-    loop {
-        if st.elapsed() > MAX_WAIT_DURATION {
-            panic!("wait for result timeout")
-        }
-        if mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    wait_for_a_mount(&mount_point);
 
     // verify that process is still alive
     let child_status = child.try_wait().unwrap();
@@ -194,17 +182,7 @@ fn run_in_background_fail_on_mount() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()
         .expect("unable to spawn child");
 
-    let st = std::time::Instant::now();
-
-    let exit_status = loop {
-        if st.elapsed() > MAX_WAIT_DURATION {
-            panic!("wait for result timeout")
-        }
-        match child.try_wait().expect("unable to wait for result") {
-            Some(result) => break result,
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    };
+    let exit_status = wait_for_child_to_exit(&mut child);
 
     // verify mount status and mount entry
     assert!(!exit_status.success());
@@ -228,17 +206,7 @@ fn run_in_foreground_fail_on_mount() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()
         .expect("unable to spawn child");
 
-    let st = std::time::Instant::now();
-
-    let exit_status = loop {
-        if st.elapsed() > MAX_WAIT_DURATION {
-            panic!("wait for result timeout")
-        }
-        match child.try_wait().expect("unable to wait for result") {
-            Some(result) => break result,
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    };
+    let exit_status = wait_for_child_to_exit(&mut child);
 
     // verify mount status and mount entry
     assert!(!exit_status.success());
@@ -324,17 +292,7 @@ fn mount_readonly() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()
         .expect("unable to spawn child");
 
-    let st = std::time::Instant::now();
-
-    loop {
-        if st.elapsed() > MAX_WAIT_DURATION {
-            panic!("wait for result timeout")
-        }
-        if mount_exists("mountpoint-s3", mount_point.path().to_str().unwrap()) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    wait_for_a_mount(&mount_point);
 
     // verify that process is still alive
     let child_status = child.try_wait().unwrap();
@@ -370,17 +328,7 @@ fn mount_allow_delete(allow_delete: bool) -> Result<(), Box<dyn std::error::Erro
     }
     let mut child = cmd.spawn().expect("unable to spawn child");
 
-    let st = std::time::Instant::now();
-
-    let exit_status = loop {
-        if st.elapsed() > MAX_WAIT_DURATION {
-            panic!("wait for result timeout")
-        }
-        match child.try_wait().expect("unable to wait for result") {
-            Some(result) => break result,
-            None => std::thread::sleep(std::time::Duration::from_millis(100)),
-        }
-    };
+    let exit_status = wait_for_child_to_exit(&mut child);
 
     // verify mount status and mount entry
     assert!(exit_status.success());
@@ -548,7 +496,44 @@ fn get_mount_from_source_and_mountpoint(source: &str, mount_point: &str) -> Opti
     None
 }
 
-#[cfg(feature = "sse_kms")]
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
+struct ChildProcess(std::process::Child);
+
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
+impl Drop for ChildProcess {
+    fn drop(&mut self) {
+        if !self
+            .0
+            .try_wait()
+            .expect("unable to get child's return status")
+            .is_some()
+        {
+            self.0.kill().expect("cannot kill mountpoint");
+            wait_for_child_to_exit(&mut self.0);
+        }
+        if let Some(logs) = self.stdout_utf8() {
+            println!("command logs: [{logs}]");
+        }
+    }
+}
+
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
+impl ChildProcess {
+    fn stdout_utf8(&mut self) -> Option<String> {
+        let stdout = self.0.stdout.take();
+        if !stdout.is_some() {
+            return None;
+        }
+        let mut buf = Vec::new();
+        stdout
+            .unwrap()
+            .read_to_end(&mut buf)
+            .expect("failed to read mountpoint log from pipe");
+        Some(String::from_utf8(buf).expect("mountpoint log is not a valid UTF-8"))
+    }
+}
+
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
 fn mount_and_check_log<F: FnOnce(&Path)>(
     bucket: &str,
     prefix: &str,
@@ -574,22 +559,14 @@ fn mount_and_check_log<F: FnOnce(&Path)>(
             .env("AWS_SECRET_ACCESS_KEY", maybe_creds.secret_access_key())
             .env("AWS_SESSION_TOKEN", maybe_creds.session_token().unwrap());
     }
-    let mut child = cmd.spawn().expect("unable to spawn child");
-    std::thread::sleep(std::time::Duration::from_millis(500)); // wait for mount
+    let mut child = ChildProcess(cmd.spawn().expect("unable to spawn child"));
+    wait_for_a_mount(&mount_point);
 
     io_fun(mount_point.path());
 
     std::thread::sleep(std::time::Duration::from_millis(500)); // wait for logs
-    child.kill().expect("cannot kill mountpoint");
-    let mut buf = Vec::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_end(&mut buf)
-        .expect("failed to read mountpoint log from pipe");
-    let log = String::from_utf8(buf).expect("mountpoint log is not a valid UTF-8");
-
+    child.0.kill().expect("cannot kill mountpoint");
+    let log = child.stdout_utf8().expect("should be able to read child's stdout");
     for line in log.lines() {
         if expected_log_line.is_match(line) {
             return;
@@ -598,6 +575,7 @@ fn mount_and_check_log<F: FnOnce(&Path)>(
     panic!("can not find a matching line in log: [{log}]");
 }
 
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
 fn erroneous_write(mount_point: &Path) {
     let mut f = File::create(mount_point.join("file.txt")).expect("can not open file for write");
     let data = vec![0xaa; 32];
@@ -608,7 +586,7 @@ fn erroneous_write(mount_point: &Path) {
     );
 }
 
-#[cfg(feature = "sse_kms")]
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
 #[test]
 fn write_with_inexistent_key() {
     let expected_log_line =
@@ -625,7 +603,7 @@ fn write_with_inexistent_key() {
     );
 }
 
-#[cfg(feature = "sse_kms")]
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
 #[test]
 fn write_with_no_permissions_for_a_key() {
     let sse_key = get_test_kms_key_id();
@@ -647,7 +625,7 @@ fn write_with_no_permissions_for_a_key() {
     );
 }
 
-#[cfg(feature = "sse_kms")]
+#[cfg(all(feature = "sse_kms", not(feature = "s3express_tests")))]
 #[test]
 fn read_with_no_permissions_for_a_key() {
     // create file
