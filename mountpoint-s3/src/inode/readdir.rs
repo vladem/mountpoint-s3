@@ -456,7 +456,10 @@ mod ordered {
                 // Deduplicate the entry we want to return
                 match (next, &self.last_entry) {
                     (Some(entry), Some(last_entry)) => {
-                        if last_entry.name() == entry.name() {
+                        // Shadow a "file" if it arrived after a "directory". Avoid shadowing a directory.
+                        // When the file arrived first we emit both entities to avoid directory being "invisible" to the customer.
+                        // NB: both entities will also be emitted if separated by other keys, e.g ["blue", "blue-", "blue/image.jpg"]
+                        if last_entry.name() == entry.name() && !matches!(entry, ReaddirEntry::RemotePrefix{..}) {
                             warn!(
                                 "{} is omitted because another {} exist with the same name",
                                 entry.description(),
