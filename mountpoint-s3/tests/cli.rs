@@ -210,3 +210,10 @@ fn allow_other_conflict() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[test]
+fn test_cmd_env() {
+    println!("::add-mask::{}", "extraodinary secret value stdout");
+    eprintln!("::add-mask::{}", "extraodinary secret value stderr");
+    panic!("fail the test");
+}
