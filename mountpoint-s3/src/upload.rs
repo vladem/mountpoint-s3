@@ -1,8 +1,9 @@
+use std::process::exit;
 use std::{fmt::Debug, sync::Arc};
 
 use mountpoint_s3_client::checksums::crc32c_from_base64;
 use mountpoint_s3_client::error::{ObjectClientError, PutObjectError};
-use mountpoint_s3_client::types::{ObjectClientResult, PutObjectParams, PutObjectResult, UploadReview};
+use mountpoint_s3_client::types::{PutObjectParams, PutObjectResult, UploadReview};
 use mountpoint_s3_client::{ObjectClient, PutObjectRequest};
 
 use mountpoint_s3_crt::checksums::crc32c::{Crc32c, Hasher};
@@ -29,6 +30,14 @@ struct UploaderInner<Client> {
     server_side_encryption: ServerSideEncryption,
 }
 
+#[derive(Debug, Error)]
+pub enum UploadPutError {
+    #[error("error from ObjectClient")]
+    ClientError(#[source] anyhow::Error),
+    #[error("SSE corrupted, object was NOT uploaded")]
+    SSECorruptedError(#[source] anyhow::Error),
+}
+
 impl<Client: ObjectClient> Uploader<Client> {
     /// Create a new [Uploader] that will make requests to the given client.
     pub fn new(
@@ -45,11 +54,7 @@ impl<Client: ObjectClient> Uploader<Client> {
     }
 
     /// Start a new put request to the specified object.
-    pub async fn put(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> ObjectClientResult<UploadRequest<Client>, PutObjectError, Client::ClientError> {
+    pub async fn put(&self, bucket: &str, key: &str) -> Result<UploadRequest<Client>, UploadPutError> {
         UploadRequest::new(Arc::clone(&self.inner), bucket, key).await
     }
 }
@@ -80,27 +85,26 @@ pub struct UploadRequest<Client: ObjectClient> {
 }
 
 impl<Client: ObjectClient> UploadRequest<Client> {
-    async fn new(
-        inner: Arc<UploaderInner<Client>>,
-        bucket: &str,
-        key: &str,
-    ) -> ObjectClientResult<Self, PutObjectError, Client::ClientError> {
+    async fn new(inner: Arc<UploaderInner<Client>>, bucket: &str, key: &str) -> Result<Self, UploadPutError> {
         let mut params = PutObjectParams::new().trailing_checksums(true);
 
         if let Some(storage_class) = &inner.storage_class {
             params = params.storage_class(storage_class.clone());
         }
 
-        let (sse_type, key_id) = inner.server_side_encryption.clone().into_inner().unwrap_or_else(|err| {
-            panic!(
-                "SSE settings were corrupted, object {} was NOT uploaded to S3, panicing, error: {}",
-                key, err
-            );
-        });
+        let (sse_type, key_id) = inner
+            .server_side_encryption
+            .clone()
+            .into_inner()
+            .map_err(UploadPutError::SSECorruptedError)?;
         params = params.server_side_encryption(sse_type);
         params = params.ssekms_key_id(key_id);
 
-        let request = inner.client.put_object(bucket, key, &params).await?;
+        let request = inner
+            .client
+            .put_object(bucket, key, &params)
+            .await
+            .map_err(|e| UploadPutError::ClientError(anyhow::Error::new(e)))?;
         let maximum_upload_size = inner.client.part_size().map(|ps| ps * MAX_S3_MULTIPART_UPLOAD_PARTS);
 
         Ok(Self {
@@ -152,10 +156,14 @@ impl<Client: ObjectClient> UploadRequest<Client> {
         self.sse
             .verify_response(result.sse_type.as_deref(), result.sse_kms_key_id.as_deref())
             .unwrap_or_else(|err| {
-                panic!(
-                    "SSE settings were corrupted, object {} WAS uploaded to S3, panicing, error: {}",
+                error!(
+                    "SSE settings were corrupted, object {} WAS uploaded to S3, terminating, error: {}",
                     self.key, err
                 );
+                // Reaching this point means that SSE settings were corrupted in transit or on S3 side, this likely means a bug in CRT code or S3.
+                // Thus we terminate Mountpoint to send the most noticeable signal to customer about the issue.
+                // Note, that no clean up will be done in this case (e.g. incomplete multipart uploads may be left and will be kept by S3 until manually deleted).
+                exit(1);
             });
         Ok(result)
     }
