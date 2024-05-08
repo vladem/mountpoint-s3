@@ -24,6 +24,7 @@ use mountpoint_s3_crt::io::event_loop::EventLoopGroup;
 use nix::sys::signal::Signal;
 use nix::unistd::ForkResult;
 use regex::Regex;
+use crate::event_log::ReportClientError;
 
 use crate::build_info;
 use crate::data_cache::{CacheLimit, DiskDataCache, DiskDataCacheConfig, ManagedCacheDir};
@@ -835,10 +836,17 @@ fn create_client_for_bucket(
             let list_request = new_client.list_objects(bucket, None, "", 0, prefix.as_str());
             futures::executor::block_on(list_request)
                 .map(|_| new_client)
+                .map_err(|err| {
+                    err.report_client_error(bucket, "");
+                    err
+                })
                 .with_context(|| format!("initial ListObjectsV2 failed for bucket {bucket} in region {region}"))
         }
-        Err(e) => Err(e)
-            .with_context(|| format!("initial ListObjectsV2 failed for bucket {bucket} in region {region_to_try}")),
+        Err(e) => {
+            e.report_client_error(bucket, "");
+            Err(e)
+                .with_context(|| format!("initial ListObjectsV2 failed for bucket {bucket} in region {region_to_try}"))
+        },
     }
 }
 

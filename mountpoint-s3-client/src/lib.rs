@@ -58,7 +58,7 @@ mod s3_crt_client;
 pub mod user_agent;
 mod util;
 
-pub use object_client::{ObjectClient, PutObjectRequest};
+pub use object_client::{ObjectClient, PutObjectRequest, ErrorCode, ListObjectsError, ObjectClientError};
 
 pub use s3_crt_client::{get_object::S3GetObjectRequest, put_object::S3PutObjectRequest, S3CrtClient, S3RequestError};
 

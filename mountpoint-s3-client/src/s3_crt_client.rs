@@ -880,6 +880,16 @@ impl S3RequestError {
     }
 }
 
+impl ErrorCode for S3RequestError {
+    fn get_code(&self) -> &str {
+        match &self {
+            Self::Forbidden(_) => "error.client.forbidden",
+            Self::NoSigningCredentials  => "error.client.no_signing_credentials",
+            _ => "error.client.internal"
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum ConstructionError {
     /// CRT error while constructing the request

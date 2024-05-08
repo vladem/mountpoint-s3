@@ -14,6 +14,7 @@ pub mod prefix;
 pub mod s3;
 mod sync;
 mod upload;
+mod event_log;
 
 pub use fs::{S3Filesystem, S3FilesystemConfig, ServerSideEncryption};
 

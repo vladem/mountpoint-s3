@@ -33,7 +33,7 @@ use fuser::FileType;
 use futures::{select_biased, FutureExt};
 use mountpoint_s3_client::error::{HeadObjectError, ObjectClientError};
 use mountpoint_s3_client::types::{HeadObjectResult, RestoreStatus};
-use mountpoint_s3_client::ObjectClient;
+use mountpoint_s3_client::{ObjectClient, ErrorCode};
 use mountpoint_s3_crt::checksums::crc32c::{self, Crc32c};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -563,6 +563,10 @@ impl Superblock {
     }
 }
 
+macro_rules! event_log_entry {
+    ($event_type:expr, $($args:tt)*) => { error!(event_type = $event_type, $($args)*) }
+}
+
 impl SuperblockInner {
     /// Retrieve the inode for the given number if it exists.
     ///
@@ -738,7 +742,13 @@ impl SuperblockInner {
                         }
                         // If the object is not found, might be a directory, so keep going
                         Err(ObjectClientError::ServiceError(HeadObjectError::NotFound)) => {},
-                        Err(e) => return Err(InodeError::ClientError(anyhow!(e).context("HeadObject failed"))),
+                        Err(ObjectClientError::ClientError(client_err)) => {
+                            // error may be reported as soon as we got response (simpler, less robust) from the client
+                            // or be passed to the caller who will report it (complicated, is it more robust though?)
+                            event_log_entry!(client_err.get_code(), internal_message = "remote_lookup failed", s3_bucket = &self.bucket, s3_object_key = full_path);
+                            return Err(InodeError::ClientError(anyhow!(client_err).context("HeadObject failed")))
+                        },
+                        Err(e @ ObjectClientError::ServiceError(_)) => return Err(InodeError::ClientError(anyhow!(e).context("HeadObject failed"))),
                     }
                 }
 

@@ -61,6 +61,10 @@ impl FromStr for ETag {
     }
 }
 
+pub trait ErrorCode {
+    fn get_code(&self) -> &str;
+}
+
 /// A generic interface to S3-like object storage services.
 ///
 /// This trait defines the common methods that all object services implement.
@@ -73,7 +77,7 @@ impl FromStr for ETag {
 pub trait ObjectClient {
     type GetObjectResult: Stream<Item = ObjectClientResult<GetBodyPart, GetObjectError, Self::ClientError>> + Send;
     type PutObjectRequest: PutObjectRequest<ClientError = Self::ClientError>;
-    type ClientError: std::error::Error + Send + Sync + 'static;
+    type ClientError: std::error::Error + Send + Sync + 'static + ErrorCode;
 
     /// Query the part size this client uses for PUT and GET operations to the object store. This
     /// can be `None` if the client does not do multi-part operations.
