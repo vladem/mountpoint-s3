@@ -30,7 +30,8 @@ env:
   S3_OLAP_ARN: ${{ vars.S3_OLAP_ARN }}
   S3_MRAP_ARN: ${{ vars.S3_MRAP_ARN }}
   KMS_TEST_KEY_ID: ${{ vars.KMS_TEST_KEY_ID }}
-  RUST_FEATURES: fuse_tests,s3_tests,fips_tests,event_log
+  RUST_FEATURES: fuse_tests,s3_tests,fips_tests
+  RUST_UNRELEASED_FEATURES: event_log
 
 permissions:
   id-token: write
@@ -81,6 +82,9 @@ jobs:
       run: cargo test --features $RUST_FEATURES --no-run
     - name: Run tests
       run: cargo test --features $RUST_FEATURES
+    # Separately run tests for unreleased features, names of tests should start with "unreleased_" prefix
+    - name: Run tests for unreleased features
+      run: cargo test --features '${{ env.RUST_FEATURES }},${{ env.RUST_UNRELEASED_FEATURES }}' -- unreleased_
     - name: Save dump files
       if: ${{ failure() && matrix.runner.name == 'Amazon Linux arm' }}
       run: ./.github/actions/scripts/save-coredump.sh
