@@ -89,12 +89,11 @@ fn main() -> Result<()> {
 
                 while start_time.elapsed().as_secs() < args.timeout.into() {
                     println!("thread {} start reading file {}", i, src.to_string_lossy());
-                    let start = Instant::now();
                     let f = File::open(src.clone()).unwrap();
                     let mut f = BufReader::new(f);
                     while let Ok(n) = f.read(&mut buffer[..]) {
                         total_read_bytes_clone.fetch_add(n as u64, Ordering::SeqCst);
-                        if n == 0 || start.elapsed().as_secs() > args.timeout.into() {
+                        if n == 0 || start_time.elapsed().as_secs() > args.timeout.into() {
                             break;
                         }
                     }
