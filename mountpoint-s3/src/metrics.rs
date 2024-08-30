@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use metrics::{Key, Metadata, Recorder};
 use mountpoint_s3_client::ObjectClient;
 use sysinfo::{get_current_pid, MemoryRefreshKind, ProcessRefreshKind, System};
+use tikv_jemalloc_ctl::{epoch, stats};
 
 use crate::mem_limiter::MemoryLimiter;
 use crate::sync::mpsc::{channel, RecvTimeoutError, Sender};
@@ -85,6 +86,18 @@ fn poll_process_metrics(sys: &mut System) {
                 metrics::gauge!("system.available_memory").set(sys.available_memory() as f64);
             }
         }
+        epoch::advance().unwrap();
+
+        let allocated = stats::allocated::read().unwrap();
+        let active = stats::active::read().unwrap();
+        let mapped = stats::mapped::read().unwrap();
+        let retained = stats::retained::read().unwrap();
+        let resident = stats::resident::read().unwrap();
+        metrics::gauge!("process.jemalloc.allocated").set(allocated as f64);
+        metrics::gauge!("process.jemalloc.active").set(active as f64);
+        metrics::gauge!("process.jemalloc.mapped").set(mapped as f64);
+        metrics::gauge!("process.jemalloc.retained").set(retained as f64);
+        metrics::gauge!("process.jemalloc.resident").set(resident as f64);
     }
 }
 
