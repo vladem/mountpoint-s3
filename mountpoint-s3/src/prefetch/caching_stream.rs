@@ -435,7 +435,7 @@ mod tests {
             ..Default::default()
         };
         let mock_client = Arc::new(MockClient::new(config));
-        let mem_limiter = Arc::new(MemoryLimiter::new(mock_client.clone(), 512 * 1024 * 1024));
+        let mem_limiter = Arc::new(MemoryLimiter::new(mock_client.clone(), Some(512 * 1024 * 1024)));
         mock_client.add_object(key, object.clone());
 
         let runtime = ThreadPool::builder().pool_size(1).create().unwrap();
@@ -516,7 +516,7 @@ mod tests {
             ..Default::default()
         };
         let mock_client = Arc::new(MockClient::new(config));
-        let mem_limiter = Arc::new(MemoryLimiter::new(mock_client.clone(), 512 * 1024 * 1024));
+        let mem_limiter = Arc::new(MemoryLimiter::new(mock_client.clone(), Some(512 * 1024 * 1024)));
         mock_client.add_object(key, object.clone());
 
         let runtime = ThreadPool::builder().pool_size(1).create().unwrap();

@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::os::unix::prelude::FromRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
@@ -24,7 +25,6 @@ use mountpoint_s3_crt::io::event_loop::EventLoopGroup;
 use nix::sys::signal::Signal;
 use nix::unistd::ForkResult;
 use regex::Regex;
-use sysinfo::{RefreshKind, System};
 
 use crate::build_info;
 use crate::data_cache::{CacheLimit, DiskDataCache, DiskDataCacheConfig, ManagedCacheDir};
@@ -32,6 +32,7 @@ use crate::fs::{CacheConfig, S3FilesystemConfig, ServerSideEncryption, TimeToLiv
 use crate::fuse::session::FuseSession;
 use crate::fuse::S3FuseFilesystem;
 use crate::logging::{init_logging, LoggingConfig};
+use crate::mem_limiter::MemoryLimiter;
 use crate::prefetch::{caching_prefetch, default_prefetch, Prefetch};
 use crate::prefix::Prefix;
 use crate::s3::S3Personality;
@@ -463,7 +464,7 @@ impl CliArgs {
 pub fn main<ClientBuilder, Client, Runtime>(client_builder: ClientBuilder) -> anyhow::Result<()>
 where
     ClientBuilder: FnOnce(&CliArgs) -> anyhow::Result<(Client, Runtime, S3Personality)>,
-    Client: ObjectClient + Send + Sync + 'static,
+    Client: ObjectClient + Clone + Send + Sync + 'static,
     Runtime: Spawn + Send + Sync + 'static,
 {
     let args = CliArgs::parse();
@@ -476,13 +477,12 @@ where
     if args.foreground {
         init_logging(args.logging_config()).context("failed to initialize logging")?;
 
-        let _metrics = metrics::install();
-
         // mount file system as a foreground process
-        let session = mount(args, client_builder)?;
+        let (session, mem_limiter) = mount(args, client_builder)?;
 
         println!("{successful_mount_msg}");
 
+        let _metrics = metrics::install(mem_limiter);
         session.join().context("failed to join session")?;
     } else {
         // mount file system as a background process
@@ -503,8 +503,6 @@ where
                 let args = CliArgs::parse();
                 init_logging(args.logging_config()).context("failed to initialize logging")?;
 
-                let _metrics = metrics::install();
-
                 let session = mount(args, client_builder);
 
                 // close unused file descriptor, we only write from this end.
@@ -517,7 +515,8 @@ where
                 let status_failure = [b'1'];
 
                 match session {
-                    Ok(session) => {
+                    Ok((session, mem_limiter)) => {
+                        let _metrics = metrics::install(mem_limiter);
                         tracing::trace!("FUSE session created OK, sending message back to parent process");
                         pipe_file
                             .write(&status_success)
@@ -712,10 +711,13 @@ pub fn create_s3_client(args: &CliArgs) -> anyhow::Result<(S3CrtClient, EventLoo
     Ok((client, runtime, s3_personality))
 }
 
-fn mount<ClientBuilder, Client, Runtime>(args: CliArgs, client_builder: ClientBuilder) -> anyhow::Result<FuseSession>
+fn mount<ClientBuilder, Client, Runtime>(
+    args: CliArgs,
+    client_builder: ClientBuilder,
+) -> anyhow::Result<(FuseSession, Arc<MemoryLimiter<Client>>)>
 where
     ClientBuilder: FnOnce(&CliArgs) -> anyhow::Result<(Client, Runtime, S3Personality)>,
-    Client: ObjectClient + Send + Sync + 'static,
+    Client: ObjectClient + Clone + Send + Sync + 'static,
     Runtime: Spawn + Send + Sync + 'static,
 {
     tracing::info!("mount-s3 {}", build_info::FULL_VERSION);
@@ -749,14 +751,6 @@ where
     filesystem_config.allow_overwrite = args.allow_overwrite;
     filesystem_config.s3_personality = s3_personality;
     filesystem_config.server_side_encryption = ServerSideEncryption::new(args.sse, args.sse_kms_key_id);
-    filesystem_config.mem_limit = if let Some(max_mem_target) = args.max_memory_target {
-        max_mem_target * 1024 * 1024
-    } else {
-        const MINIMUM_MEM_LIMIT: u64 = 512 * 1024 * 1024;
-        let sys = System::new_with_specifics(RefreshKind::everything());
-        let default_mem_target = (sys.total_memory() as f64 * 0.95) as u64;
-        default_mem_target.max(MINIMUM_MEM_LIMIT)
-    };
 
     // Written in this awkward way to force us to update it if we add new checksum types
     filesystem_config.use_upload_checksums = match args.upload_checksums {
@@ -795,6 +789,8 @@ where
     tracing::trace!("using metadata TTL setting {metadata_cache_ttl:?}");
     filesystem_config.cache_config = CacheConfig::new(metadata_cache_ttl);
 
+    let mem_limit = args.max_memory_target.map(|limit_mb| limit_mb * 1024 * 1024);
+    let mem_limiter = Arc::new(MemoryLimiter::new(Arc::new(client.clone()), mem_limit));
     if let Some(path) = args.cache {
         let cache_config = match args.max_cache_size {
             // Fallback to no data cache.
@@ -816,6 +812,7 @@ where
             let mut fuse_session = create_filesystem(
                 client,
                 prefetcher,
+                mem_limiter.clone(),
                 &args.bucket_name,
                 &args.prefix.unwrap_or_default(),
                 filesystem_config,
@@ -827,7 +824,7 @@ where
                 drop(managed_cache_dir);
             }));
 
-            return Ok(fuse_session);
+            return Ok((fuse_session, mem_limiter));
         }
     }
 
@@ -835,17 +832,21 @@ where
     create_filesystem(
         client,
         prefetcher,
+        mem_limiter.clone(),
         &args.bucket_name,
         &args.prefix.unwrap_or_default(),
         filesystem_config,
         fuse_config,
         &bucket_description,
     )
+    .map(|session| (session, mem_limiter))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_filesystem<Client, Prefetcher>(
     client: Client,
     prefetcher: Prefetcher,
+    mem_limiter: Arc<MemoryLimiter<Client>>,
     bucket_name: &str,
     prefix: &Prefix,
     filesystem_config: S3FilesystemConfig,
@@ -857,7 +858,7 @@ where
     Prefetcher: Prefetch + Send + Sync + 'static,
 {
     tracing::trace!(?filesystem_config, "creating file system");
-    let fs = S3FuseFilesystem::new(client, prefetcher, bucket_name, prefix, filesystem_config);
+    let fs = S3FuseFilesystem::new(client, prefetcher, mem_limiter, bucket_name, prefix, filesystem_config);
     tracing::debug!(?fuse_session_config, "creating fuse session");
     let session = Session::new(fs, &fuse_session_config.mount_point, &fuse_session_config.options)
         .context("Failed to create FUSE session")?;

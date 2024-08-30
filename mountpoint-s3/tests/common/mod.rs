@@ -14,6 +14,7 @@ use aws_credential_types::Credentials;
 use fuser::{FileAttr, FileType};
 use futures::executor::ThreadPool;
 use mountpoint_s3::fs::{DirectoryEntry, DirectoryReplier};
+use mountpoint_s3::mem_limiter::MemoryLimiter;
 use mountpoint_s3::prefetch::{default_prefetch, DefaultPrefetcher};
 use mountpoint_s3::prefix::Prefix;
 use mountpoint_s3::{S3Filesystem, S3FilesystemConfig};
@@ -54,11 +55,12 @@ pub fn make_test_filesystem_with_client<Client>(
     config: S3FilesystemConfig,
 ) -> TestS3Filesystem<Client>
 where
-    Client: ObjectClient + Send + Sync + 'static,
+    Client: ObjectClient + Clone + Send + Sync + 'static,
 {
     let runtime = ThreadPool::builder().pool_size(1).create().unwrap();
     let prefetcher = default_prefetch(runtime, Default::default());
-    S3Filesystem::new(client, prefetcher, bucket, prefix, config)
+    let mem_limiter = Arc::new(MemoryLimiter::new(Arc::new(client.clone()), None));
+    S3Filesystem::new(client, prefetcher, mem_limiter, bucket, prefix, config)
 }
 
 #[track_caller]

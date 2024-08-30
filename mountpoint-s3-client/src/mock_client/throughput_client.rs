@@ -25,6 +25,7 @@ use super::MockGetObjectRequest;
 /// be starved.
 ///
 /// TODO: make it bi-directional, so that upload throughput can be simulated as well.
+#[derive(Clone)]
 pub struct ThroughputMockClient {
     inner: MockClient,
     /// A throughput rate limiter with one token per byte

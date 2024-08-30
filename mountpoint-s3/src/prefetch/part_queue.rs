@@ -190,7 +190,7 @@ mod tests {
 
     async fn run_test(ops: Vec<Op>) {
         let client = Arc::new(MockClient::new(Default::default()));
-        let mem_limiter = MemoryLimiter::new(client.clone(), 512 * 1024 * 1024);
+        let mem_limiter = MemoryLimiter::new(client.clone(), Some(512 * 1024 * 1024));
         let part_id = ObjectId::new("key".to_owned(), ETag::for_tests());
         let (mut part_queue, part_queue_producer) = unbounded_part_queue::<DummyError, MockClient>(mem_limiter.into());
         let mut current_offset = 0;

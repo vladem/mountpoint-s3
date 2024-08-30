@@ -4,11 +4,13 @@ use futures::executor::block_on;
 use mountpoint_s3_client::ObjectClient;
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 use time::OffsetDateTime;
 use tracing::{field, instrument, Instrument};
 
 use crate::fs::{DirectoryEntry, DirectoryReplier, InodeNo, S3Filesystem, S3FilesystemConfig, ToErrno};
+use crate::mem_limiter::MemoryLimiter;
 use crate::prefetch::Prefetch;
 use crate::prefix::Prefix;
 #[cfg(target_os = "macos")]
@@ -79,11 +81,12 @@ where
     pub fn new(
         client: Client,
         prefetcher: Prefetcher,
+        mem_limiter: Arc<MemoryLimiter<Client>>,
         bucket: &str,
         prefix: &Prefix,
         config: S3FilesystemConfig,
     ) -> Self {
-        let fs = S3Filesystem::new(client, prefetcher, bucket, prefix, config);
+        let fs = S3Filesystem::new(client, prefetcher, mem_limiter, bucket, prefix, config);
 
         Self { fs }
     }

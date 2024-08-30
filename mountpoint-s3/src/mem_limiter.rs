@@ -2,6 +2,7 @@ use std::sync::{atomic::Ordering, Arc};
 
 use humansize::make_format;
 use metrics::atomics::AtomicU64;
+use sysinfo::{RefreshKind, System};
 use tracing::debug;
 
 use mountpoint_s3_client::ObjectClient;
@@ -20,7 +21,13 @@ pub struct MemoryLimiter<Client: ObjectClient> {
 }
 
 impl<Client: ObjectClient> MemoryLimiter<Client> {
-    pub fn new(client: Arc<Client>, mem_limit: u64) -> Self {
+    pub fn new(client: Arc<Client>, mem_limit: Option<u64>) -> Self {
+        let mem_limit = mem_limit.unwrap_or_else(|| {
+            const MINIMUM_MEM_LIMIT: u64 = 512 * 1024 * 1024;
+            let sys = System::new_with_specifics(RefreshKind::everything());
+            let default_mem_target = (sys.total_memory() as f64 * 0.95) as u64;
+            default_mem_target.max(MINIMUM_MEM_LIMIT)
+        });
         let min_reserved = 128 * 1024 * 1024;
         let reserved_mem = (mem_limit / 8).max(min_reserved);
         let formatter = make_format(humansize::BINARY);
@@ -98,6 +105,12 @@ impl<Client: ObjectClient> MemoryLimiter<Client> {
                 additional_mem_reserved = formatter(self.additional_mem_reserved),
                 "total memory usage"
             );
+            metrics::gauge!("process.memory_limiter.total_usage").set(total_usage as f64);
+            metrics::gauge!("process.memory_limiter.client_mem_used").set(client_stats.mem_used as f64);
+            metrics::gauge!("process.memory_limiter.client_mem_reserved").set(client_stats.mem_reserved as f64);
+            metrics::gauge!("process.memory_limiter.prefetcher_mem_used").set(prefetcher_mem_used as f64);
+            metrics::gauge!("process.memory_limiter.prefetcher_mem_reserved").set(prefetcher_mem_reserved as f64);
+            metrics::gauge!("process.memory_limiter.additional_mem_reserved").set(self.additional_mem_reserved as f64);
         }
     }
 }

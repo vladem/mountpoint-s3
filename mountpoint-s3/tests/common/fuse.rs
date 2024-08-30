@@ -6,6 +6,7 @@ use std::sync::Arc;
 use fuser::{BackgroundSession, MountOption, Session};
 use mountpoint_s3::data_cache::DataCache;
 use mountpoint_s3::fuse::S3FuseFilesystem;
+use mountpoint_s3::mem_limiter::MemoryLimiter;
 use mountpoint_s3::prefetch::{Prefetch, PrefetcherConfig};
 use mountpoint_s3::prefix::Prefix;
 use mountpoint_s3::S3FilesystemConfig;
@@ -84,7 +85,7 @@ fn create_fuse_session<Client, Prefetcher>(
     filesystem_config: S3FilesystemConfig,
 ) -> BackgroundSession
 where
-    Client: ObjectClient + Send + Sync + 'static,
+    Client: ObjectClient + Clone + Send + Sync + 'static,
     Prefetcher: Prefetch + Send + Sync + 'static,
 {
     let options = vec![
@@ -95,8 +96,9 @@ where
     ];
 
     let prefix = Prefix::new(prefix).expect("valid prefix");
+    let mem_limiter = Arc::new(MemoryLimiter::new(Arc::new(client.clone()), None));
     let session = Session::new(
-        S3FuseFilesystem::new(client, prefetcher, bucket, &prefix, filesystem_config),
+        S3FuseFilesystem::new(client, prefetcher, mem_limiter, bucket, &prefix, filesystem_config),
         mount_dir,
         &options,
     )

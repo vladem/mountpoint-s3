@@ -580,7 +580,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(MockClient::new(config));
-        let mem_limiter = MemoryLimiter::new(client.clone(), 512 * 1024 * 1024);
+        let mem_limiter = MemoryLimiter::new(client.clone(), Some(512 * 1024 * 1024));
         let object = MockObject::ramp(0xaa, size as usize, ETag::for_tests());
         let etag = object.etag();
 
@@ -675,7 +675,7 @@ mod tests {
         Stream: ObjectPartStream + Send + Sync + 'static,
     {
         let client = Arc::new(MockClient::new(client_config));
-        let mem_limiter = MemoryLimiter::new(client.clone(), 512 * 1024 * 1024);
+        let mem_limiter = MemoryLimiter::new(client.clone(), Some(512 * 1024 * 1024));
         let read_size = 1 * MB;
         let object_size = 8 * MB;
         let object = MockObject::ramp(0xaa, object_size, ETag::for_tests());
@@ -782,7 +782,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         ));
-        let mem_limiter = MemoryLimiter::new(client.clone(), 512 * 1024 * 1024);
+        let mem_limiter = MemoryLimiter::new(client.clone(), Some(512 * 1024 * 1024));
 
         let prefetcher_config = PrefetcherConfig {
             max_read_window_size: test_config.max_read_window_size,
@@ -907,7 +907,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(MockClient::new(config));
-        let mem_limiter = MemoryLimiter::new(client.clone(), 512 * 1024 * 1024);
+        let mem_limiter = MemoryLimiter::new(client.clone(), Some(512 * 1024 * 1024));
         let object = MockObject::ramp(0xaa, object_size as usize, ETag::for_tests());
         let etag = object.etag();
 
@@ -1091,7 +1091,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         ));
-        let mem_limiter = MemoryLimiter::new(client.clone(), 512 * 1024 * 1024);
+        let mem_limiter = MemoryLimiter::new(client.clone(), Some(512 * 1024 * 1024));
 
         let prefetcher = Prefetcher::new(default_stream(), Default::default());
         let mem_limiter = Arc::new(mem_limiter);
@@ -1144,7 +1144,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(MockClient::new(config));
-        let mem_limiter = Arc::new(MemoryLimiter::new(client.clone(), 512 * 1024 * 1024));
+        let mem_limiter = Arc::new(MemoryLimiter::new(client.clone(), Some(512 * 1024 * 1024)));
         let object = MockObject::ramp(0xaa, OBJECT_SIZE, ETag::for_tests());
         let etag = object.etag();
 
@@ -1186,7 +1186,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(MockClient::new(config));
-        let mem_limiter = Arc::new(MemoryLimiter::new(client.clone(), 512 * 1024 * 1024));
+        let mem_limiter = Arc::new(MemoryLimiter::new(client.clone(), Some(512 * 1024 * 1024)));
         let object = MockObject::ramp(0xaa, OBJECT_SIZE, ETag::for_tests());
         let etag = object.etag();
 
@@ -1248,7 +1248,7 @@ mod tests {
                 ..Default::default()
             };
             let client = Arc::new(MockClient::new(config));
-            let mem_limiter = MemoryLimiter::new(client.clone(), 512 * 1024 * 1024);
+            let mem_limiter = MemoryLimiter::new(client.clone(), Some(512 * 1024 * 1024));
             let object = MockObject::ramp(0xaa, object_size as usize, ETag::for_tests());
             let file_etag = object.etag();
 
@@ -1314,7 +1314,7 @@ mod tests {
                 ..Default::default()
             };
             let client = Arc::new(MockClient::new(config));
-            let mem_limiter = MemoryLimiter::new(client.clone(), 512 * 1024 * 1024);
+            let mem_limiter = MemoryLimiter::new(client.clone(), Some(512 * 1024 * 1024));
             let object = MockObject::ramp(0xaa, object_size as usize, ETag::for_tests());
             let file_etag = object.etag();
 

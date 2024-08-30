@@ -8,8 +8,10 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use metrics::{Key, Metadata, Recorder};
+use mountpoint_s3_client::ObjectClient;
 use sysinfo::{get_current_pid, MemoryRefreshKind, ProcessRefreshKind, System};
 
+use crate::mem_limiter::MemoryLimiter;
 use crate::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use crate::sync::Arc;
 
@@ -30,7 +32,9 @@ pub const TARGET_NAME: &str = "mountpoint_s3::metrics";
 /// done with their work; metrics generated after shutting down the sink will be lost.
 ///
 /// Panics if a sink has already been installed.
-pub fn install() -> MetricsSinkHandle {
+pub fn install<Client: ObjectClient + Clone + Send + Sync + 'static>(
+    mem_limiter: Arc<MemoryLimiter<Client>>,
+) -> MetricsSinkHandle {
     let sink = Arc::new(MetricsSink::new());
     let mut sys = System::new();
 
@@ -44,6 +48,7 @@ pub fn install() -> MetricsSinkHandle {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {
                         poll_process_metrics(&mut sys);
+                        mem_limiter.log_total_usage();
                         inner.publish()
                     }
                 }

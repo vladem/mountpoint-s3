@@ -400,8 +400,6 @@ pub struct S3FilesystemConfig {
     pub server_side_encryption: ServerSideEncryption,
     /// Use additional checksums for uploads
     pub use_upload_checksums: bool,
-    /// Memory limit
-    pub mem_limit: u64,
 }
 
 impl Default for S3FilesystemConfig {
@@ -422,7 +420,6 @@ impl Default for S3FilesystemConfig {
             s3_personality: S3Personality::default(),
             server_side_encryption: Default::default(),
             use_upload_checksums: true,
-            mem_limit: 512 * 1024 * 1024,
         }
     }
 }
@@ -556,6 +553,7 @@ where
     pub fn new(
         client: Client,
         prefetcher: Prefetcher,
+        mem_limiter: Arc<MemoryLimiter<Client>>,
         bucket: &str,
         prefix: &Prefix,
         config: S3FilesystemConfig,
@@ -569,7 +567,6 @@ where
         let superblock = Superblock::new(bucket, prefix, superblock_config);
 
         let client = Arc::new(client);
-        let mem_limiter = Arc::new(MemoryLimiter::new(client.clone(), config.mem_limit));
 
         let uploader = Uploader::new(
             client.clone(),
@@ -1377,7 +1374,8 @@ mod tests {
             server_side_encryption,
             ..Default::default()
         };
-        let mut fs = S3Filesystem::new(client, prefetcher, bucket, &Default::default(), fs_config);
+        let mem_limiter = Arc::new(MemoryLimiter::new(Arc::new(client.clone()), None));
+        let mut fs = S3Filesystem::new(client, prefetcher, mem_limiter, bucket, &Default::default(), fs_config);
 
         // Lookup inode of the dir1 directory
         let entry = fs.lookup(FUSE_ROOT_INODE, "dir1".as_ref()).await.unwrap();
