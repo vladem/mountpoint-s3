@@ -3,11 +3,11 @@ use clap::Parser;
 use crossbeam_channel::{bounded, select, tick, Receiver};
 use humansize::make_format;
 use std::{
-    fs::{self, File},
+    fs::File,
     io::{BufReader, Read},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -19,9 +19,6 @@ use sysinfo::{Pid, System};
 struct MainCli {
     /// Mountpoint process id to monitor
     mountpoint_pid: u32,
-    /// Start copy tasks
-    #[clap(long, help = "Set to start copy tasks")]
-    start_copy: bool,
     /// Start the read tasks
     #[clap(long, help = "Set to start read tasks")]
     start_read: bool,
@@ -47,12 +44,7 @@ fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
 
 fn main() -> Result<()> {
     let args = MainCli::parse();
-    println!(
-        "Starting monitoring tool with mountpoint_pid={} start_read={} start_copy={} num_tasks={} print_header={}",
-        args.mountpoint_pid, args.start_read, args.start_copy, args.num_tasks, args.print_header
-    );
-
-    let completed = Arc::new(AtomicBool::new(false));
+    println!("Starting monitoring tool with args: {:?}", args);
 
     let ctrl_c_events = ctrl_channel()?;
     let ticks = tick(Duration::from_secs(1));
@@ -60,30 +52,12 @@ fn main() -> Result<()> {
     let start_time = Instant::now();
     let mut thread_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let total_read_bytes = Arc::new(AtomicU64::new(0));
-    if args.start_copy {
-        for i in 0..args.num_tasks {
-            let handle = thread::spawn(move || {
-                let src_dir = Path::new("/home/ubuntu/mounted-s3");
-                let dest = Path::new("/dev/null");
-                let src = src_dir.join(format!("sequential_read_direct_io.0.0"));
-                println!(
-                    "start copying file from {} to {}",
-                    src.to_string_lossy(),
-                    dest.to_string_lossy(),
-                );
-                fs::copy(&src, &dest).unwrap();
-                println!("copying to file {} is complete", dest.to_string_lossy());
-            });
-            thread_handles.push(handle);
-        }
-    }
-
     if args.start_read {
         for i in 0..args.num_tasks {
             let total_read_bytes_clone = total_read_bytes.clone();
             let handle = thread::spawn(move || {
                 let src_dir = Path::new("/home/ubuntu/mounted-s3");
-                let src = src_dir.join(format!("sequential_read_direct_io.0.0"));
+                let src = src_dir.join("sequential_read.0.0");
                 const READ_SIZE: usize = 4 * 1024;
                 let mut buffer = [0; READ_SIZE];
 
@@ -162,16 +136,16 @@ fn main() -> Result<()> {
         ge_target: f64,
         ge_2x_target: f64,
         elapsed_s: u64,
-    };
+    }
 
     let elapsed = start_time.elapsed().as_secs();
     let total_read_bytes = total_read_bytes.load(Ordering::SeqCst);
 
-    let mut stat = Stat{
+    let mut stat = Stat {
         threads: args.num_tasks as u64,
         elapsed_s: elapsed,
         avg_throughput_mibs: (total_read_bytes as f64 / elapsed as f64 / 1024.0 / 1024.0) as u64,
-        max_rss_mib: (max_mem_usage / 1024 / 1024) as u64,
+        max_rss_mib: max_mem_usage / 1024 / 1024,
         avg_rss_mib: mem_usage_sum / 1024 / 1024 / total_samples,
         ..Default::default()
     };
