@@ -3,6 +3,9 @@ use std::ops::Deref;
 use std::ops::Range;
 use std::os::unix::prelude::OsStrExt;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::channel::mpsc::UnboundedReceiver;
@@ -11,6 +14,7 @@ use mountpoint_s3_crt::common::error::Error;
 use mountpoint_s3_crt::http::request_response::Header;
 use mountpoint_s3_crt::s3::client::MetaRequestResult;
 use pin_project::pin_project;
+use pin_project::pinned_drop;
 
 use crate::object_client::{ETag, GetBodyPart, GetObjectError, ObjectClientError, ObjectClientResult};
 use crate::s3_crt_client::{
@@ -62,17 +66,21 @@ impl S3CrtClient {
             .set_request_path(key)
             .map_err(S3RequestError::construction_failure)?;
 
+        let bytes_in_channel = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = futures::channel::mpsc::unbounded();
         let read_window_end_offset = next_offset + self.inner.initial_read_window_size as u64;
 
         let mut options = S3CrtClientInner::new_meta_request_options(message, S3Operation::GetObject);
         options.part_size(self.inner.read_part_size as u64);
+        let bytes_in_channel_clone = bytes_in_channel.clone();
         let request = self.inner.make_meta_request_from_options(
             options,
             span,
             |_| (),
             |_, _| (),
             move |offset, data| {
+                bytes_in_channel_clone.fetch_add(data.len() as u64, Ordering::SeqCst);
+                metrics::gauge!("s3.client.bytes_in_channel").increment(data.len() as f64);
                 let _ = sender.unbounded_send(Ok((offset, data.into())));
             },
             move |result| {
@@ -91,7 +99,17 @@ impl S3CrtClient {
             enable_backpressure: self.inner.enable_backpressure,
             next_offset,
             read_window_end_offset,
+            bytes_in_channel,
         })
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for S3GetObjectRequest {
+    fn drop(self: Pin<&mut Self>) {
+        let mut this = self.project();
+        this.finish_receiver.close();
+        metrics::gauge!("s3.client.bytes_in_channel").decrement(this.bytes_in_channel.load(Ordering::SeqCst) as f64);
     }
 }
 
@@ -101,7 +119,7 @@ impl S3CrtClient {
 /// Each item of the stream is a part of the object body together with the part's offset within the
 /// object.
 #[derive(Debug)]
-#[pin_project]
+#[pin_project(PinnedDrop)]
 pub struct S3GetObjectRequest {
     #[pin]
     request: S3HttpRequest<(), GetObjectError>,
@@ -114,6 +132,7 @@ pub struct S3GetObjectRequest {
     /// Upper bound of the current read window. When backpressure is enabled, [S3GetObjectRequest]
     /// can return data up to this offset *exclusively*.
     read_window_end_offset: u64,
+    bytes_in_channel: Arc<AtomicU64>,
 }
 
 impl GetObjectRequest for S3GetObjectRequest {
@@ -143,6 +162,8 @@ impl Stream for S3GetObjectRequest {
             let result = match val {
                 Ok(item) => {
                     *this.next_offset = item.0 + item.1.len() as u64;
+                    this.bytes_in_channel.fetch_sub(item.1.len() as u64, Ordering::SeqCst);
+                    metrics::gauge!("s3.client.bytes_in_channel").decrement(item.1.len() as f64);
                     Some(Ok(item))
                 }
                 Err(e) => Some(Err(ObjectClientError::ClientError(e.into()))),
