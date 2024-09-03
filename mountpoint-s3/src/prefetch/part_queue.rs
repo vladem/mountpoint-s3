@@ -3,7 +3,10 @@ use std::time::Instant;
 
 use tracing::trace;
 
-use crate::mem_limiter::MemoryLimiter;
+use crate::prefetch::backpressure_controller::{
+    BackpressureController,
+    BackpressureFeedbackEvent::{DataRead, PartQueueStall},
+};
 use crate::prefetch::part::Part;
 use crate::prefetch::PrefetchReadError;
 use crate::sync::async_channel::{unbounded, Receiver, RecvError, Sender};
@@ -19,22 +22,22 @@ pub struct PartQueue<E: std::error::Error, Client: ObjectClient> {
     failed: AtomicBool,
     /// The total number of bytes sent to the underlying queue of `self.receiver`
     bytes_received: Arc<AtomicUsize>,
-    _mem_limiter: Arc<MemoryLimiter<Client>>, // todo: remove
+    bytes_pushed_front: u64,
+    backpressure_controller: BackpressureController<Client>,
 }
 
 /// Producer side of the queue of [Part]s.
 #[derive(Debug)]
-pub struct PartQueueProducer<E: std::error::Error, Client: ObjectClient> {
+pub struct PartQueueProducer<E: std::error::Error> {
     sender: Sender<Result<Part, PrefetchReadError<E>>>,
     /// The total number of bytes sent to `self.sender`
     bytes_sent: Arc<AtomicUsize>,
-    _mem_limiter: Arc<MemoryLimiter<Client>>,
 }
 
 /// Creates an unbounded [PartQueue] and its related [PartQueueProducer].
 pub fn unbounded_part_queue<E: std::error::Error, Client: ObjectClient>(
-    mem_limiter: Arc<MemoryLimiter<Client>>,
-) -> (PartQueue<E, Client>, PartQueueProducer<E, Client>) {
+    backpressure_controller: BackpressureController<Client>,
+) -> (PartQueue<E, Client>, PartQueueProducer<E>) {
     let (sender, receiver) = unbounded();
     let bytes_counter = Arc::new(AtomicUsize::new(0));
     let part_queue = PartQueue {
@@ -42,12 +45,12 @@ pub fn unbounded_part_queue<E: std::error::Error, Client: ObjectClient>(
         receiver,
         failed: AtomicBool::new(false),
         bytes_received: Arc::clone(&bytes_counter),
-        _mem_limiter: mem_limiter.clone(),
+        bytes_pushed_front: 0,
+        backpressure_controller,
     };
     let part_queue_producer = PartQueueProducer {
         sender,
         bytes_sent: bytes_counter,
-        _mem_limiter: mem_limiter,
     };
     (part_queue, part_queue_producer)
 }
@@ -67,13 +70,21 @@ impl<E: std::error::Error + Send + Sync, Client: ObjectClient> PartQueue<E, Clie
             "cannot use a PartQueue after failure"
         );
 
+        let mut from_prefetcher = 0;
         let part = if let Some(current_part) = current_part.take() {
+            debug_assert!(current_part.len() as u64 >= self.bytes_pushed_front);
+            from_prefetcher = self.bytes_pushed_front.min(length as u64);
+            self.bytes_pushed_front = self.bytes_pushed_front.saturating_sub(length as u64);
             Ok(current_part)
         } else {
             // Do `try_recv` first so we can track whether the read is starved or not
             if let Ok(part) = self.receiver.try_recv() {
                 part
             } else {
+                // If the part queue is empty it means we are reading faster than the task could prefetch,
+                // so we should use larger window for the task.
+                self.backpressure_controller.send_feedback(PartQueueStall).await?;
+
                 let start = Instant::now();
                 let part = self.receiver.recv().await;
                 metrics::histogram!("prefetch.part_queue_starved_us").record(start.elapsed().as_micros() as f64);
@@ -97,13 +108,23 @@ impl<E: std::error::Error + Send + Sync, Client: ObjectClient> PartQueue<E, Clie
             let tail = part.split_off(length);
             *current_part = Some(tail);
         }
+
+        // We read some data out of the part queue so the read window should be moved.
+        // We don't account data added from the backwards seek window (prefetcher) in the read window computations.
+        self.backpressure_controller
+            .send_feedback(DataRead(part.len() - from_prefetcher as usize))
+            .await?;
+
         metrics::gauge!("prefetch.bytes_in_queue").decrement(part.len() as f64);
+        metrics::gauge!("prefetch.bytes_in_queue_from_client").decrement((part.len() as u64 - from_prefetcher) as f64);
         Ok(part)
     }
 
     /// Push a new [Part] onto the front of the queue
     /// which actually just concatenate it with the current part
-    pub async fn push_front(&self, mut part: Part) -> Result<(), PrefetchReadError<E>> {
+    pub async fn push_front(&mut self, mut part: Part) -> Result<(), PrefetchReadError<E>> {
+        self.bytes_pushed_front += part.len() as u64;
+
         let part_len = part.len();
         let mut current_part = self.current_part.lock().await;
 
@@ -125,9 +146,13 @@ impl<E: std::error::Error + Send + Sync, Client: ObjectClient> PartQueue<E, Clie
     pub fn bytes_received(&self) -> usize {
         self.bytes_received.load(Ordering::SeqCst)
     }
+
+    pub fn read_window_end_offset(&self) -> u64 {
+        self.backpressure_controller.read_window_end_offset()
+    }
 }
 
-impl<E: std::error::Error + Send + Sync, Client: ObjectClient> PartQueueProducer<E, Client> {
+impl<E: std::error::Error + Send + Sync> PartQueueProducer<E> {
     /// Push a new [Part] onto the back of the queue
     pub fn push(&self, part: Result<Part, PrefetchReadError<E>>) {
         let part_len = part.as_ref().map_or(0, |part| part.len());
@@ -139,6 +164,7 @@ impl<E: std::error::Error + Send + Sync, Client: ObjectClient> PartQueueProducer
         } else {
             self.bytes_sent.fetch_add(part_len, Ordering::SeqCst);
             metrics::gauge!("prefetch.bytes_in_queue").increment(part_len as f64);
+            metrics::gauge!("prefetch.bytes_in_queue_from_client").increment(part_len as f64);
         }
     }
 }
@@ -160,13 +186,17 @@ impl<E: std::error::Error, Client: ObjectClient> Drop for PartQueue<E, Client> {
         }
         let remaining = current_size + queue_size;
         metrics::gauge!("prefetch.bytes_in_queue").decrement(remaining as f64);
+        metrics::gauge!("prefetch.bytes_in_queue_from_client")
+            .decrement((remaining as u64 - self.bytes_pushed_front) as f64);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::checksums::ChecksummedBytes;
+    use crate::mem_limiter::MemoryLimiter;
     use crate::object::ObjectId;
+    use crate::prefetch::backpressure_controller::{new_backpressure_controller, BackpressureConfig};
 
     use super::*;
 
@@ -191,8 +221,19 @@ mod tests {
     async fn run_test(ops: Vec<Op>) {
         let client = Arc::new(MockClient::new(Default::default()));
         let mem_limiter = MemoryLimiter::new(client.clone(), 512 * 1024 * 1024);
+        let dummy_backpressure_config = BackpressureConfig {
+            initial_read_window_size: 0,
+            min_read_window_size: 0,
+            max_read_window_size: 0,
+            read_window_size_multiplier: 0,
+            request_range: 0..1,
+            read_part_size: 0,
+        };
+        let (backpressure_controller, _) =
+            new_backpressure_controller(dummy_backpressure_config, Arc::new(mem_limiter));
         let part_id = ObjectId::new("key".to_owned(), ETag::for_tests());
-        let (mut part_queue, part_queue_producer) = unbounded_part_queue::<DummyError, MockClient>(mem_limiter.into());
+        let (mut part_queue, part_queue_producer) =
+            unbounded_part_queue::<DummyError, MockClient>(backpressure_controller);
         let mut current_offset = 0;
         let mut current_length = 0;
         for op in ops {

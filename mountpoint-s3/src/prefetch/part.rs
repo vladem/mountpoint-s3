@@ -44,10 +44,6 @@ impl Part {
         }
     }
 
-    pub(super) fn offset(&self) -> u64 {
-        self.offset
-    }
-
     pub(super) fn len(&self) -> usize {
         self.checksummed_bytes.len()
     }

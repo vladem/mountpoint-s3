@@ -63,7 +63,7 @@ where
         };
         let (backpressure_controller, backpressure_limiter) =
             new_backpressure_controller(backpressure_config, mem_limiter.clone());
-        let (part_queue, part_queue_producer) = unbounded_part_queue(mem_limiter);
+        let (part_queue, part_queue_producer) = unbounded_part_queue(backpressure_controller);
         trace!(?range, "spawning request");
 
         let request_task = {
@@ -74,7 +74,7 @@ where
 
         let task_handle = self.runtime.spawn_with_handle(request_task).unwrap();
 
-        RequestTask::from_handle(task_handle, range, part_queue, backpressure_controller)
+        RequestTask::from_handle(task_handle, range, part_queue)
     }
 }
 
@@ -120,7 +120,7 @@ where
     async fn get_from_cache(
         mut self,
         range: RequestRange,
-        part_queue_producer: PartQueueProducer<Client::ClientError, Client>,
+        part_queue_producer: PartQueueProducer<Client::ClientError>,
     ) {
         let cache_key = &self.config.object_id;
         let block_size = self.cache.block_size();
@@ -179,7 +179,7 @@ where
         &mut self,
         range: RequestRange,
         block_range: Range<u64>,
-        part_queue_producer: PartQueueProducer<Client::ClientError, Client>,
+        part_queue_producer: PartQueueProducer<Client::ClientError>,
     ) {
         let bucket = &self.config.bucket;
         let cache_key = &self.config.object_id;
@@ -233,8 +233,8 @@ where
     }
 }
 
-struct CachingPartComposer<E: std::error::Error, Cache, Client: ObjectClient> {
-    part_queue_producer: PartQueueProducer<E, Client>,
+struct CachingPartComposer<E: std::error::Error, Cache> {
+    part_queue_producer: PartQueueProducer<E>,
     cache_key: ObjectId,
     original_range: RequestRange,
     block_index: u64,
@@ -243,11 +243,10 @@ struct CachingPartComposer<E: std::error::Error, Cache, Client: ObjectClient> {
     cache: Arc<Cache>,
 }
 
-impl<E, Cache, Client> CachingPartComposer<E, Cache, Client>
+impl<E, Cache> CachingPartComposer<E, Cache>
 where
     E: std::error::Error + Send + Sync,
     Cache: DataCache + Send + Sync,
-    Client: ObjectClient + Send + Sync + 'static,
 {
     async fn try_compose_parts(&mut self, request_stream: impl Stream<Item = RequestReaderOutput<E>>) {
         if let Err(e) = self.compose_parts(request_stream).await {

@@ -206,7 +206,7 @@ where
         };
         let (backpressure_controller, mut backpressure_limiter) =
             new_backpressure_controller(backpressure_config, mem_limiter.clone());
-        let (part_queue, part_queue_producer) = unbounded_part_queue(mem_limiter);
+        let (part_queue, part_queue_producer) = unbounded_part_queue(backpressure_controller);
         trace!(?range, "spawning request");
 
         let span = debug_span!("prefetch", ?range);
@@ -235,20 +235,19 @@ where
             )
             .unwrap();
 
-        RequestTask::from_handle(task_handle, range, part_queue, backpressure_controller)
+        RequestTask::from_handle(task_handle, range, part_queue)
     }
 }
 
-struct ClientPartComposer<E: std::error::Error, Client: ObjectClient> {
-    part_queue_producer: PartQueueProducer<E, Client>,
+struct ClientPartComposer<E: std::error::Error> {
+    part_queue_producer: PartQueueProducer<E>,
     object_id: ObjectId,
     preferred_part_size: usize,
 }
 
-impl<E, Client> ClientPartComposer<E, Client>
+impl<E> ClientPartComposer<E>
 where
     E: std::error::Error + Send + Sync,
-    Client: ObjectClient + Send + Sync + 'static,
 {
     async fn try_compose_parts(&self, request_stream: impl Stream<Item = RequestReaderOutput<E>>) {
         if let Err(e) = self.compose_parts(request_stream).await {
@@ -376,6 +375,9 @@ fn read_from_request<'a, Client: ObjectClient + 'a>(
             let (offset, body) = next
                 .inspect_err(|e| error!(key=id.key(), error=?e, "GetObject body part failed"))
                 .map_err(PrefetchReadError::GetRequestFailed)?;
+
+            let read_excess = offset.saturating_sub(backpressure_limiter.read_window_end_offset());
+            metrics::histogram!("s3.client.read_excess").record(read_excess as f64);
 
             let length = body.len() as u64;
             trace!(offset, length, "received GetObject part");
