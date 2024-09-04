@@ -153,7 +153,6 @@ impl<Client: ObjectClient> BackpressureController<Client> {
                         available_mem += (new_read_window_size - scaled_down) as u64;
                         new_read_window_size = scaled_down;
                     }
-                    new_read_window_size = new_read_window_size.max(self.min_read_window_size);
                     if new_read_window_size != self.preferred_read_window_size {
                         self.scale_down(new_read_window_size);
                     }
