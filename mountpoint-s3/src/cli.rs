@@ -26,7 +26,9 @@ use nix::unistd::ForkResult;
 use regex::Regex;
 
 use crate::build_info;
-use crate::data_cache::{CacheLimit, DiskDataCache, DiskDataCacheConfig, ExpressDataCache, ManagedCacheDir};
+use crate::data_cache::{
+    CacheLimit, DiskDataCache, DiskDataCacheConfig, ExpressDataCache, ManagedCacheDir, MultilevelDataCache,
+};
 use crate::fs::{CacheConfig, S3FilesystemConfig, ServerSideEncryption, TimeToLive};
 use crate::fuse::session::FuseSession;
 use crate::fuse::S3FuseFilesystem;
@@ -261,7 +263,7 @@ pub struct CliArgs {
         help = "Enable caching of object content to the given directory and set metadata TTL to 60 seconds",
         help_heading = CACHING_OPTIONS_HEADER,
         value_name = "DIRECTORY",
-        group = "cache_group",
+        // group = "cache_group",
     )]
     pub cache: Option<PathBuf>,
 
@@ -289,7 +291,7 @@ pub struct CliArgs {
         help = "Size of a cache block in KiB [Default: 1024 (1 MiB) for disk cache, 512 (512 KiB) for S3 Express cache]",
         help_heading = CACHING_OPTIONS_HEADER,
         value_name = "KiB",
-        requires = "cache_group"
+        // requires = "cache_group"
     )]
     pub cache_block_size: Option<u64>,
 
@@ -300,7 +302,7 @@ pub struct CliArgs {
         help_heading = CACHING_OPTIONS_HEADER,
         value_name = "BUCKET",
         value_parser = parse_bucket_name,
-        group = "cache_group",
+        // group = "cache_group",
     )]
     pub cache_express: Option<String>,
 
@@ -412,7 +414,7 @@ impl CliArgs {
             return kib * 1024;
         }
         if self.cache_express_bucket_name().is_some() {
-            return 512 * 1024; // 512 KiB block size - default for express cache
+            return 1024 * 1024; // 1 MiB block size - default for express cache
         }
         1024 * 1024 // 1 MiB block size - default for disk cache
     }
@@ -811,6 +813,46 @@ where
     }
     tracing::trace!("using metadata TTL setting {metadata_cache_ttl:?}");
     filesystem_config.cache_config = CacheConfig::new(metadata_cache_ttl);
+
+    if args.cache.is_some() && args.cache_express_bucket_name().is_some() {
+        tracing::warn!("using multilevel cache");
+        let cache_limit = CacheLimit::default(); // todo: allow configuring the limit
+        let cache_config = DiskDataCacheConfig {
+            block_size: args.cache_block_size_in_bytes(),
+            limit: cache_limit,
+        };
+        let cache_key = env_unstable_cache_key();
+        let managed_cache_dir =
+            ManagedCacheDir::new_from_parent_with_cache_key(args.cache.as_ref().unwrap(), cache_key)
+                .context("failed to create cache directory")?;
+        let cache1 = DiskDataCache::new(managed_cache_dir.as_path_buf(), cache_config);
+
+        let source_description = &args.bucket_name;
+        let cache2 = ExpressDataCache::new(
+            args.cache_express_bucket_name().as_ref().unwrap(),
+            client.clone(),
+            source_description,
+            args.cache_block_size_in_bytes(),
+        );
+
+        let cache = MultilevelDataCache::new(cache1, cache2);
+        let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
+        let mut fuse_session = create_filesystem(
+            client,
+            prefetcher,
+            &args.bucket_name,
+            &args.prefix.unwrap_or_default(),
+            filesystem_config,
+            fuse_config,
+            &bucket_description,
+        )?;
+
+        fuse_session.run_on_close(Box::new(move || {
+            drop(managed_cache_dir);
+        }));
+
+        return Ok(fuse_session);
+    }
 
     if let Some(path) = &args.cache {
         let cache_limit = match args.max_cache_size {
