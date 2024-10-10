@@ -2,6 +2,7 @@ use crate::error_metadata::{ClientErrorMetadata, ProvideErrorMetadata};
 use async_trait::async_trait;
 use auto_impl::auto_impl;
 use futures::Stream;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::time::SystemTime;
@@ -311,6 +312,7 @@ pub struct PutObjectParams {
     /// If `server_side_encryption` has a valid value of aws:kms or aws:kms:dsse, this value may be used to specify AWS KMS key ID to be used
     /// when creating new S3 object
     pub ssekms_key_id: Option<String>,
+    pub additional_headers: HashMap<String, String>,
 }
 
 impl PutObjectParams {
@@ -395,6 +397,8 @@ pub trait GetObjectRequest:
     /// Get the upper bound of the current read window. When backpressure is enabled, [GetObjectRequest] can
     /// return data up to this offset *exclusively*.
     fn read_window_end_offset(self: Pin<&Self>) -> u64;
+
+    fn get_attributes(self: Pin<&Self>) -> HashMap<String, String>;
 }
 
 /// A streaming put request which allows callers to asynchronously write the body of the request.

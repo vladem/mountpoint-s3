@@ -3,6 +3,8 @@ use std::ops::Deref;
 use std::ops::Range;
 use std::os::unix::prelude::OsStrExt;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
 
 use futures::channel::mpsc::UnboundedReceiver;
@@ -11,6 +13,7 @@ use mountpoint_s3_crt::common::error::Error;
 use mountpoint_s3_crt::http::request_response::Header;
 use mountpoint_s3_crt::s3::client::MetaRequestResult;
 use pin_project::pin_project;
+use std::collections::HashMap;
 
 use crate::object_client::{ETag, GetBodyPart, GetObjectError, ObjectClientError, ObjectClientResult};
 use crate::s3_crt_client::{
@@ -67,11 +70,23 @@ impl S3CrtClient {
 
         let mut options = S3CrtClientInner::new_meta_request_options(message, S3Operation::GetObject);
         options.part_size(self.inner.read_part_size as u64);
+        let attributes = Arc::new(Mutex::new(HashMap::new()));
+        let attributes_writter = attributes.clone();
         let request = self.inner.make_meta_request_from_options(
             options,
             span,
             |_| (),
-            |_, _| (),
+            move |headers, _status| {
+                let mut attributes_writter = attributes_writter.lock().unwrap();
+                for (key, value) in headers.iter() {
+                    let key = key.to_string_lossy().to_string();
+                    let value = value.to_string_lossy().to_string();
+                    if !key.starts_with("x-amz-meta-") {
+                        continue;
+                    }
+                    attributes_writter.insert(key, value);
+                }
+            },
             move |offset, data| {
                 let _ = sender.unbounded_send(Ok((offset, data.into())));
             },
@@ -91,6 +106,7 @@ impl S3CrtClient {
             enable_backpressure: self.inner.enable_backpressure,
             next_offset,
             read_window_end_offset,
+            attributes,
         })
     }
 }
@@ -114,6 +130,7 @@ pub struct S3GetObjectRequest {
     /// Upper bound of the current read window. When backpressure is enabled, [S3GetObjectRequest]
     /// can return data up to this offset *exclusively*.
     read_window_end_offset: u64,
+    attributes: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl GetObjectRequest for S3GetObjectRequest {
@@ -126,6 +143,10 @@ impl GetObjectRequest for S3GetObjectRequest {
 
     fn read_window_end_offset(self: Pin<&Self>) -> u64 {
         self.read_window_end_offset
+    }
+
+    fn get_attributes(self: Pin<&Self>) -> HashMap<String, String> {
+        self.attributes.lock().unwrap().clone()
     }
 }
 

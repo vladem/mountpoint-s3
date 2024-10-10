@@ -100,6 +100,11 @@ impl S3CrtClient {
             message
                 .set_header(&Header::new("Content-Length", content_length.to_string()))
                 .map_err(S3RequestError::construction_failure)?;
+            for (header_name, header_value) in params.additional_headers.clone() {
+                message
+                    .set_header(&Header::new(header_name, header_value))
+                    .map_err(S3RequestError::construction_failure)?;
+            }
             let body_input_stream =
                 InputStream::new_from_slice(&self.inner.allocator, slice).map_err(S3RequestError::CrtError)?;
             message.set_body_stream(Some(body_input_stream));
