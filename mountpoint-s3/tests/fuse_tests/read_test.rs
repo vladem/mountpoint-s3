@@ -31,6 +31,7 @@ fn basic_read_test<F>(creator_fn: F, prefix: &str, read_only: bool)
 where
     F: FnOnce(&str, TestSessionConfig) -> (TempDir, BackgroundSession, TestClientBox),
 {
+    use rand_chacha::ChaChaRng;
     let mut rng = ChaChaRng::seed_from_u64(0x87654321);
 
     let (mount_point, _session, mut test_client) = creator_fn(prefix, Default::default());
@@ -96,6 +97,17 @@ fn basic_read_test_s3_with_cache(read_only: bool) {
     basic_read_test(
         fuse::s3_session::new_with_cache(InMemoryDataCache::new(1024 * 1024)),
         "basic_read_test_with_cache",
+        read_only,
+    );
+}
+
+#[cfg(all(feature = "s3_tests", feature = "s3express_tests"))]
+#[test_case(true; "read only")]
+#[test_case(false; "readwrite")]
+fn basic_read_test_s3_with_express_cache(read_only: bool) {
+    basic_read_test(
+        fuse::s3_session::new_with_express_cache(),
+        "basic_read_test_s3_with_express_cache",
         read_only,
     );
 }

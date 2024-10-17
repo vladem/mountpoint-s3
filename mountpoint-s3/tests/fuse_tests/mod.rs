@@ -11,3 +11,5 @@ mod semantics_doc_test;
 mod setattr_test;
 mod unlink_test;
 mod write_test;
+#[cfg(feature = "consecutive_tests")]
+mod consecutive;

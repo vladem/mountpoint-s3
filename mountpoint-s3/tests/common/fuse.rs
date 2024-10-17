@@ -274,12 +274,15 @@ pub mod s3_session {
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{ChecksumAlgorithm, GlacierJobParameters, RestoreRequest, Tier};
     use aws_sdk_s3::Client;
+    use mountpoint_s3::data_cache::ExpressDataCache;
     use mountpoint_s3::prefetch::{caching_prefetch, default_prefetch};
     use mountpoint_s3_client::config::{EndpointConfig, S3ClientConfig};
     use mountpoint_s3_client::types::{Checksum, PutObjectTrailingChecksums};
     use mountpoint_s3_client::S3CrtClient;
 
-    use crate::common::s3::{get_test_bucket_and_prefix, get_test_region, get_test_sdk_client};
+    use crate::common::s3::{
+        get_express_cache_bucket, get_standard_bucket, get_test_bucket_and_prefix, get_test_region, get_test_sdk_client,
+    };
 
     /// Create a FUSE mount backed by a real S3 client
     pub fn new(test_name: &str, test_config: TestSessionConfig) -> (TempDir, BackgroundSession, TestClientBox) {
@@ -329,6 +332,51 @@ pub mod s3_session {
                 .read_backpressure(true)
                 .initial_read_window(test_config.initial_read_window_size);
             let client = S3CrtClient::new(client_config).unwrap();
+            let runtime = client.event_loop_group();
+            let prefetcher = caching_prefetch(cache, runtime, test_config.prefetcher_config);
+            let session = create_fuse_session(
+                client,
+                prefetcher,
+                &bucket,
+                &prefix,
+                mount_dir.path(),
+                test_config.filesystem_config,
+            );
+            let test_client = create_test_client(&region, &bucket, &prefix);
+
+            (mount_dir, session, test_client)
+        }
+    }
+
+    /// Create a FUSE mount backed by a real S3 client with an express cache.
+    /// Uses S3 Standard as a source bucket and S3 Express as a cache.
+    ///
+    /// Note, that since all instances are using the same cache bucket, a good test
+    /// should use random object keys to avoid cache hits from previous runs.
+    ///
+    /// We rely on lifecycle policies to clean up the cached blocks.
+    ///
+    /// Requires `s3express_tests` feature to provide access to the express bucket.
+    #[cfg(feature = "s3express_tests")]
+    pub fn new_with_express_cache(
+    ) -> impl FnOnce(&str, TestSessionConfig) -> (TempDir, BackgroundSession, TestClientBox) {
+        move |test_name, test_config| {
+            let mount_dir = tempfile::tempdir().unwrap();
+
+            let (_, prefix) = get_test_bucket_and_prefix(test_name);
+            let bucket = get_standard_bucket();
+            let region = get_test_region();
+
+            let client_config = S3ClientConfig::default()
+                .part_size(test_config.part_size)
+                .endpoint_config(EndpointConfig::new(&region))
+                .read_backpressure(true)
+                .initial_read_window(test_config.initial_read_window_size);
+            let client = S3CrtClient::new(client_config).unwrap();
+
+            let express_bucket_name = get_express_cache_bucket();
+            let cache = ExpressDataCache::new(&express_bucket_name, client.clone(), &express_bucket_name, 1024 * 1024);
+
             let runtime = client.event_loop_group();
             let prefetcher = caching_prefetch(cache, runtime, test_config.prefetcher_config);
             let session = create_fuse_session(

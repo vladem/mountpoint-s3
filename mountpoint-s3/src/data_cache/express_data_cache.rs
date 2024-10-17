@@ -53,14 +53,8 @@ where
             block_size,
         }
     }
-}
 
-#[async_trait]
-impl<Client> DataCache for ExpressDataCache<Client>
-where
-    Client: ObjectClient + Send + Sync + 'static,
-{
-    async fn get_block(
+    async fn read_block(
         &self,
         cache_key: &ObjectId,
         block_idx: BlockIndex,
@@ -94,6 +88,26 @@ where
         }
         let buffer = buffer.freeze();
         DataCacheResult::Ok(Some(buffer.into()))
+    }
+}
+
+#[async_trait]
+impl<Client> DataCache for ExpressDataCache<Client>
+where
+    Client: ObjectClient + Send + Sync + 'static,
+{
+    async fn get_block(
+        &self,
+        cache_key: &ObjectId,
+        block_idx: BlockIndex,
+        block_offset: u64,
+    ) -> DataCacheResult<Option<ChecksummedBytes>> {
+        let read_result = self.read_block(cache_key, block_idx, block_offset).await;
+        match read_result {
+            Ok(Some(_)) => metrics::counter!("express_data_cache.block_hit").increment(1),
+            Err(_) | Ok(None) => metrics::counter!("express_data_cache.block_hit").increment(0),
+        }
+        read_result
     }
 
     async fn put_block(

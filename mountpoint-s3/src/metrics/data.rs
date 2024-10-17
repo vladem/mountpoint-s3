@@ -45,6 +45,18 @@ impl Metric {
 
     /// Generate a string representation of this metric, or None if the metric has had no values
     /// emitted since the last call to this function.
+    pub fn get_and_reset(&self) -> Option<u64> {
+        match self {
+            Metric::Counter(inner) => {
+                let (sum, _) = inner.load_and_reset()?;
+                Some(sum)
+            }
+            _ => None, // todo: record other metric types
+        }
+    }
+
+    /// Generate a string representation of this metric, or None if the metric has had no values
+    /// emitted since the last call to this function.
     pub fn fmt_and_reset(&self) -> Option<String> {
         match self {
             Metric::Counter(inner) => {

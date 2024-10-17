@@ -3,6 +3,7 @@
 //! This module hooks up the [metrics](https://docs.rs/metrics) facade to a metrics sink that
 //! currently just emits them to a tracing log entry.
 
+use std::collections::HashMap;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -84,18 +85,18 @@ fn poll_process_metrics(sys: &mut System) {
 }
 
 #[derive(Debug)]
-struct MetricsSink {
+pub struct MetricsSink {
     metrics: DashMap<Key, Metric>,
 }
 
 impl MetricsSink {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             metrics: DashMap::with_capacity(64),
         }
     }
 
-    fn counter(&self, key: &Key) -> metrics::Counter {
+    pub fn counter(&self, key: &Key) -> metrics::Counter {
         let entry = self.metrics.entry(key.clone()).or_insert_with(Metric::counter);
         entry.as_counter()
     }
@@ -140,12 +141,27 @@ impl MetricsSink {
             tracing::info!(target: TARGET_NAME, "{}", metric);
         }
     }
+
+    pub fn publish_as_hash_map(&self) -> HashMap<String, u64> {
+        // Collect the output lines so we can sort them to make reading easier
+        let mut metrics = HashMap::new();
+
+        for mut entry in self.metrics.iter_mut() {
+            let (key, metric) = entry.pair_mut();
+            let Some(metric) = metric.get_and_reset() else {
+                continue;
+            };
+            // todo: record labels
+            metrics.insert(key.name().to_string(), metric);
+        }
+        metrics
+    }
 }
 
 /// The actual recorder that will be installed for the metrics facade. Just a wrapper around a
 /// [MetricsSinkInner] that does all the real work.
-struct MetricsRecorder {
-    sink: Arc<MetricsSink>,
+pub struct MetricsRecorder {
+    pub sink: Arc<MetricsSink>,
 }
 
 impl Recorder for MetricsRecorder {
