@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::task::{Spawn, SpawnExt};
-use tracing::{debug, warn};
+use tracing::{trace, warn};
 
 use crate::object::ObjectId;
 
@@ -28,8 +28,11 @@ impl<DiskCache: DataCache, ExpressCache: DataCache, Runtime: Spawn>
 }
 
 #[async_trait]
-impl<DiskCache: DataCache + Sync + Send + 'static, ExpressCache: DataCache + Sync, Runtime: Spawn + Sync> DataCache
-    for MultilevelDataCache<DiskCache, ExpressCache, Runtime>
+impl<DiskCache, ExpressCache, Runtime> DataCache for MultilevelDataCache<DiskCache, ExpressCache, Runtime>
+where
+    DiskCache: DataCache + Sync + Send + 'static,
+    ExpressCache: DataCache + Sync,
+    Runtime: Spawn + Sync,
 {
     async fn get_block(
         &self,
@@ -37,12 +40,17 @@ impl<DiskCache: DataCache + Sync + Send + 'static, ExpressCache: DataCache + Syn
         block_idx: BlockIndex,
         block_offset: u64,
     ) -> DataCacheResult<Option<ChecksummedBytes>> {
-        if let Some(data) = self.disk_cache.get_block(cache_key, block_idx, block_offset).await? {
-            debug!(cache_key=?cache_key, block_idx=block_idx, "block served from the disk cache");
-            return DataCacheResult::Ok(Some(data));
+        match self.disk_cache.get_block(cache_key, block_idx, block_offset).await {
+            Ok(Some(data)) => {
+                trace!(cache_key=?cache_key, block_idx=block_idx, "block served from the disk cache");
+                return DataCacheResult::Ok(Some(data));
+            }
+            Ok(None) => (),
+            Err(err) => warn!(cache_key=?cache_key, block_idx=block_idx, ?err, "error reading block from disk cache"),
         }
+
         if let Some(data) = self.express_cache.get_block(cache_key, block_idx, block_offset).await? {
-            debug!(cache_key=?cache_key, block_idx=block_idx, "block served from the express cache");
+            trace!(cache_key=?cache_key, block_idx=block_idx, "block served from the express cache");
             let cache_key = cache_key.clone();
             let cache = self.disk_cache.clone();
             let data_cloned = data.clone();
@@ -52,12 +60,13 @@ impl<DiskCache: DataCache + Sync + Send + 'static, ExpressCache: DataCache + Syn
                         .put_block(cache_key.clone(), block_idx, block_offset, data_cloned)
                         .await
                     {
-                        warn!(cache_key=?cache_key, block_idx, ?error, "failed to update cache");
+                        warn!(cache_key=?cache_key, block_idx, ?error, "failed to update the local cache");
                     }
                 })
                 .unwrap();
             return DataCacheResult::Ok(Some(data));
         }
+
         DataCacheResult::Ok(None)
     }
 
@@ -68,9 +77,15 @@ impl<DiskCache: DataCache + Sync + Send + 'static, ExpressCache: DataCache + Syn
         block_offset: u64,
         bytes: ChecksummedBytes,
     ) -> DataCacheResult<()> {
-        self.disk_cache
+        match self
+            .disk_cache
             .put_block(cache_key.clone(), block_idx, block_offset, bytes.clone())
-            .await?;
+            .await
+        {
+            Ok(_) => (),
+            Err(error) => warn!(cache_key=?cache_key, block_idx, ?error, "failed to update the local cache"),
+        }
+
         self.express_cache
             .put_block(cache_key, block_idx, block_offset, bytes)
             .await
