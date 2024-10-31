@@ -54,7 +54,6 @@ pub trait DataCache {
         cache_key: &ObjectId,
         block_idx: BlockIndex,
         block_offset: u64,
-        object_size: usize,
     ) -> DataCacheResult<Option<ChecksummedBytes>>;
 
     /// Put block of data to the cache for the given [ObjectId] and [BlockIndex].
@@ -64,7 +63,6 @@ pub trait DataCache {
         block_idx: BlockIndex,
         block_offset: u64,
         bytes: ChecksummedBytes,
-        object_size: usize,
     ) -> DataCacheResult<()>;
 
     /// Returns the block size for the data cache.

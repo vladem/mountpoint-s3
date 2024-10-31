@@ -36,21 +36,12 @@ impl<DiskCache: DataCache + Sync + Send + 'static, ExpressCache: DataCache + Syn
         cache_key: &ObjectId,
         block_idx: BlockIndex,
         block_offset: u64,
-        object_size: usize,
     ) -> DataCacheResult<Option<ChecksummedBytes>> {
-        if let Some(data) = self
-            .disk_cache
-            .get_block(cache_key, block_idx, block_offset, object_size)
-            .await?
-        {
+        if let Some(data) = self.disk_cache.get_block(cache_key, block_idx, block_offset).await? {
             debug!(cache_key=?cache_key, block_idx=block_idx, "block served from the disk cache");
             return DataCacheResult::Ok(Some(data));
         }
-        if let Some(data) = self
-            .express_cache
-            .get_block(cache_key, block_idx, block_offset, object_size)
-            .await?
-        {
+        if let Some(data) = self.express_cache.get_block(cache_key, block_idx, block_offset).await? {
             debug!(cache_key=?cache_key, block_idx=block_idx, "block served from the express cache");
             let cache_key = cache_key.clone();
             let cache = self.disk_cache.clone();
@@ -58,7 +49,7 @@ impl<DiskCache: DataCache + Sync + Send + 'static, ExpressCache: DataCache + Syn
             self.runtime
                 .spawn(async move {
                     if let Err(error) = cache
-                        .put_block(cache_key.clone(), block_idx, block_offset, data_cloned, object_size)
+                        .put_block(cache_key.clone(), block_idx, block_offset, data_cloned)
                         .await
                     {
                         warn!(cache_key=?cache_key, block_idx, ?error, "failed to update cache");
@@ -76,13 +67,12 @@ impl<DiskCache: DataCache + Sync + Send + 'static, ExpressCache: DataCache + Syn
         block_idx: BlockIndex,
         block_offset: u64,
         bytes: ChecksummedBytes,
-        object_size: usize,
     ) -> DataCacheResult<()> {
         self.disk_cache
-            .put_block(cache_key.clone(), block_idx, block_offset, bytes.clone(), object_size)
+            .put_block(cache_key.clone(), block_idx, block_offset, bytes.clone())
             .await?;
         self.express_cache
-            .put_block(cache_key, block_idx, block_offset, bytes, object_size)
+            .put_block(cache_key, block_idx, block_offset, bytes)
             .await
     }
 
@@ -101,7 +91,6 @@ mod tests {
     use mountpoint_s3_client::mock_client::{MockClient, MockClientConfig};
     use mountpoint_s3_client::types::ETag;
 
-    const EXPRESS_CACHE_MAX_OBJECT_SIZE: usize = 1024 * 1024;
     const PART_SIZE: usize = 8 * 1024 * 1024;
     const BLOCK_SIZE: u64 = 1024 * 1024;
 
@@ -129,13 +118,7 @@ mod tests {
         let client = MockClient::new(config);
         (
             client.clone(),
-            ExpressDataCache::new(
-                bucket,
-                client,
-                "unique source description",
-                BLOCK_SIZE,
-                EXPRESS_CACHE_MAX_OBJECT_SIZE,
-            ),
+            ExpressDataCache::new(bucket, client, "unique source description", BLOCK_SIZE),
         )
     }
 
@@ -147,12 +130,11 @@ mod tests {
         let cache = MultilevelDataCache::new(disk_cache, express_cache, runtime);
 
         let data = ChecksummedBytes::new("Foo".into());
-        let object_size = data.len();
         let cache_key = ObjectId::new("a".into(), ETag::for_tests());
 
         // put in both caches
         cache
-            .put_block(cache_key.clone(), 0, 0, data.clone(), object_size)
+            .put_block(cache_key.clone(), 0, 0, data.clone())
             .await
             .expect("put should succeed");
 
@@ -162,7 +144,7 @@ mod tests {
         // check it was put to local
         client.remove_all_objects();
         let entry = cache
-            .get_block(&cache_key, 0, 0, object_size)
+            .get_block(&cache_key, 0, 0)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -178,10 +160,9 @@ mod tests {
         let (client, express_cache) = default_express_cache();
 
         let data = ChecksummedBytes::new("Foo".into());
-        let object_size = data.len();
         let cache_key = ObjectId::new("a".into(), ETag::for_tests());
         express_cache
-            .put_block(cache_key.clone(), 0, 0, data.clone(), object_size)
+            .put_block(cache_key.clone(), 0, 0, data.clone())
             .await
             .expect("put should succeed");
 
@@ -190,7 +171,7 @@ mod tests {
 
         // get from express, put entry in the local cache
         let entry = cache
-            .get_block(&cache_key, 0, 0, object_size)
+            .get_block(&cache_key, 0, 0)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -206,7 +187,7 @@ mod tests {
         let mut retries = 10;
         let entry = loop {
             let entry = cache
-                .get_block(&cache_key, 0, 0, object_size)
+                .get_block(&cache_key, 0, 0)
                 .await
                 .expect("cache should be accessible");
             if let Some(entry_data) = entry {
@@ -237,34 +218,16 @@ mod tests {
         let cache_key_in_both = ObjectId::new("key_in_both".into(), ETag::for_tests());
         // put a key to local only
         disk_cache
-            .put_block(
-                cache_key_in_local.clone(),
-                0,
-                0,
-                local_data_1.clone(),
-                local_data_1.len(),
-            )
+            .put_block(cache_key_in_local.clone(), 0, 0, local_data_1.clone())
             .await
             .expect("put should succeed");
         // put another key to both caches, but store different data in those
         disk_cache
-            .put_block(
-                cache_key_in_both.clone(),
-                0,
-                0,
-                local_data_2.clone(),
-                local_data_2.len(),
-            )
+            .put_block(cache_key_in_both.clone(), 0, 0, local_data_2.clone())
             .await
             .expect("put should succeed");
         express_cache
-            .put_block(
-                cache_key_in_both.clone(),
-                0,
-                0,
-                express_data.clone(),
-                express_data.len(),
-            )
+            .put_block(cache_key_in_both.clone(), 0, 0, express_data.clone())
             .await
             .expect("put should succeed");
 
@@ -273,7 +236,7 @@ mod tests {
 
         // get data, which is stored in local only
         let entry = cache
-            .get_block(&cache_key_in_local, 0, 0, local_data_1.len())
+            .get_block(&cache_key_in_local, 0, 0)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -284,7 +247,7 @@ mod tests {
 
         // get data, which is stored in both caches and check that local has a priority
         let entry = cache
-            .get_block(&cache_key_in_both, 0, 0, local_data_2.len())
+            .get_block(&cache_key_in_both, 0, 0)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -300,10 +263,9 @@ mod tests {
         let (_, express_cache) = default_express_cache();
 
         let data = ChecksummedBytes::new("Foo".into());
-        let object_size = data.len();
         let cache_key = ObjectId::new("a".into(), ETag::for_tests());
         express_cache
-            .put_block(cache_key.clone(), 0, 0, data.clone(), object_size)
+            .put_block(cache_key.clone(), 0, 0, data.clone())
             .await
             .expect("put should succeed");
 
@@ -311,7 +273,7 @@ mod tests {
         let cache = MultilevelDataCache::new(disk_cache, express_cache, runtime);
 
         let entry = cache
-            .get_block(&cache_key, 0, 0, object_size)
+            .get_block(&cache_key, 0, 0)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");

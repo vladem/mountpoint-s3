@@ -796,25 +796,6 @@ fn create_disk_cache(
     Ok((managed_cache_dir, DiskDataCache::new(cache_dir_path, cache_config)))
 }
 
-fn create_express_cache<Client: ObjectClient + Send + Sync + 'static>(
-    express_bucket_name: &str,
-    source_bucket_name: &str,
-    block_size: u64,
-    client: Client,
-) -> ExpressDataCache<Client> {
-    // bypass express cache for objects larger than 1 MiB
-    const EXPRESS_CACHE_MAX_OBJECT_SIZE: usize = 1024 * 1024;
-    // The cache can be shared across instances mounting the same bucket (including with different prefixes)
-    let source_description = source_bucket_name;
-    ExpressDataCache::new(
-        express_bucket_name,
-        client,
-        source_description,
-        block_size,
-        EXPRESS_CACHE_MAX_OBJECT_SIZE,
-    )
-}
-
 fn mount<ClientBuilder, Client, Runtime>(args: CliArgs, client_builder: ClientBuilder) -> anyhow::Result<FuseSession>
 where
     ClientBuilder: FnOnce(&CliArgs) -> anyhow::Result<(Client, Runtime, S3Personality)>,
@@ -902,11 +883,11 @@ where
     match (args.disk_data_cache_config(), args.cache_express_bucket_name()) {
         (None, Some(express_bucket_name)) => {
             tracing::debug!("using express cache");
-            let express_cache = create_express_cache(
+            let express_cache = ExpressDataCache::new(
                 express_bucket_name,
+                client.clone(),
                 &args.bucket_name,
                 args.cache_block_size_in_bytes(),
-                client.clone(),
             );
 
             let prefetcher = caching_prefetch(express_cache, runtime, prefetcher_config);
@@ -946,11 +927,11 @@ where
         (Some((cache_dir_path, disk_data_cache_config)), Some(express_bucket_name)) => {
             tracing::debug!("using multilevel cache");
             let (managed_cache_dir, disk_cache) = create_disk_cache(cache_dir_path, disk_data_cache_config)?;
-            let express_cache = create_express_cache(
+            let express_cache = ExpressDataCache::new(
                 express_bucket_name,
+                client.clone(),
                 &args.bucket_name,
                 args.cache_block_size_in_bytes(),
-                client.clone(),
             );
             let cache = MultilevelDataCache::new(Arc::new(disk_cache), express_cache, runtime.clone());
 

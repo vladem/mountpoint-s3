@@ -19,7 +19,6 @@ pub struct ExpressDataCache<Client: ObjectClient> {
     bucket_name: String,
     prefix: String,
     block_size: u64,
-    max_object_size: usize,
 }
 
 impl<S, C> From<ObjectClientError<S, C>> for DataCacheError
@@ -39,13 +38,7 @@ where
     /// Create a new instance.
     ///
     /// TODO: consider adding some validation of the bucket.
-    pub fn new(
-        bucket_name: &str,
-        client: Client,
-        source_description: &str,
-        block_size: u64,
-        max_object_size: usize,
-    ) -> Self {
+    pub fn new(bucket_name: &str, client: Client, source_description: &str, block_size: u64) -> Self {
         let prefix = hex::encode(
             Sha256::new()
                 .chain_update(CACHE_VERSION.as_bytes())
@@ -58,7 +51,6 @@ where
             bucket_name: bucket_name.to_owned(),
             prefix,
             block_size,
-            max_object_size,
         }
     }
 }
@@ -73,12 +65,7 @@ where
         cache_key: &ObjectId,
         block_idx: BlockIndex,
         block_offset: u64,
-        object_size: usize,
     ) -> DataCacheResult<Option<ChecksummedBytes>> {
-        if object_size > self.max_object_size {
-            return Ok(None);
-        }
-
         if block_offset != block_idx * self.block_size {
             return Err(DataCacheError::InvalidBlockOffset);
         }
@@ -120,12 +107,7 @@ where
         block_idx: BlockIndex,
         block_offset: u64,
         bytes: ChecksummedBytes,
-        object_size: usize,
     ) -> DataCacheResult<()> {
-        if object_size > self.max_object_size {
-            return Ok(());
-        }
-
         if block_offset != block_idx * self.block_size {
             return Err(DataCacheError::InvalidBlockOffset);
         }
@@ -172,8 +154,6 @@ mod tests {
     use mountpoint_s3_client::mock_client::{MockClient, MockClientConfig};
     use mountpoint_s3_client::types::ETag;
 
-    const EXPRESS_CACHE_MAX_OBJECT_SIZE: usize = 1024 * 1024;
-
     #[test_case(1024, 512 * 1024; "block_size smaller than part_size")]
     #[test_case(8 * 1024 * 1024, 512 * 1024; "block_size larger than part_size")]
     #[tokio::test]
@@ -188,20 +168,11 @@ mod tests {
         };
         let client = Arc::new(MockClient::new(config));
 
-        let cache = ExpressDataCache::new(
-            bucket,
-            client,
-            "unique source description",
-            block_size,
-            EXPRESS_CACHE_MAX_OBJECT_SIZE,
-        );
+        let cache = ExpressDataCache::new(bucket, client, "unique source description", block_size);
 
         let data_1 = ChecksummedBytes::new("Foo".into());
         let data_2 = ChecksummedBytes::new("Bar".into());
         let data_3 = ChecksummedBytes::new("a".repeat(block_size as usize).into());
-
-        let object_1_size = data_1.len() + data_3.len();
-        let object_2_size = data_2.len();
 
         let cache_key_1 = ObjectId::new("a".into(), ETag::for_tests());
         let cache_key_2 = ObjectId::new(
@@ -210,7 +181,7 @@ mod tests {
         );
 
         let block = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(&cache_key_1, 0, 0)
             .await
             .expect("cache should be accessible");
         assert!(
@@ -221,11 +192,11 @@ mod tests {
 
         // PUT and GET, OK?
         cache
-            .put_block(cache_key_1.clone(), 0, 0, data_1.clone(), object_1_size)
+            .put_block(cache_key_1.clone(), 0, 0, data_1.clone())
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(&cache_key_1, 0, 0)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -236,11 +207,11 @@ mod tests {
 
         // PUT AND GET block for a second key, OK?
         cache
-            .put_block(cache_key_2.clone(), 0, 0, data_2.clone(), object_2_size)
+            .put_block(cache_key_2.clone(), 0, 0, data_2.clone())
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_2, 0, 0, object_2_size)
+            .get_block(&cache_key_2, 0, 0)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -251,11 +222,11 @@ mod tests {
 
         // PUT AND GET a second block in a cache entry, OK?
         cache
-            .put_block(cache_key_1.clone(), 1, block_size, data_3.clone(), object_1_size)
+            .put_block(cache_key_1.clone(), 1, block_size, data_3.clone())
             .await
             .expect("cache should be accessible");
         let entry = cache
-            .get_block(&cache_key_1, 1, block_size, object_1_size)
+            .get_block(&cache_key_1, 1, block_size)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -266,7 +237,7 @@ mod tests {
 
         // Entry 1's first block still intact
         let entry = cache
-            .get_block(&cache_key_1, 0, 0, object_1_size)
+            .get_block(&cache_key_1, 0, 0)
             .await
             .expect("cache should be accessible")
             .expect("cache entry should be returned");
@@ -274,35 +245,5 @@ mod tests {
             data_1, entry,
             "cache entry returned should match original bytes after put"
         );
-    }
-
-    #[tokio::test]
-    async fn large_object_bypassed() {
-        let bucket = "test-bucket";
-        let config = MockClientConfig {
-            bucket: bucket.to_string(),
-            part_size: 8 * 1024 * 1024,
-            enable_backpressure: true,
-            initial_read_window_size: 8 * 1024 * 1024,
-            ..Default::default()
-        };
-        let client = Arc::new(MockClient::new(config));
-
-        let cache = ExpressDataCache::new(bucket, client, "unique source description", 1024 * 1024, 1024);
-
-        let data_1 = vec![0u8; 1025];
-        let data_1 = ChecksummedBytes::new(data_1.into());
-        let cache_key_1 = ObjectId::new("a".into(), ETag::for_tests());
-
-        // PUT and GET for a large object should silently fail
-        cache
-            .put_block(cache_key_1.clone(), 0, 0, data_1.clone(), data_1.len())
-            .await
-            .expect("cache should be accessible");
-        let get_result = cache
-            .get_block(&cache_key_1, 0, 0, data_1.len())
-            .await
-            .expect("cache should be accessible");
-        assert!(get_result.is_none());
     }
 }
