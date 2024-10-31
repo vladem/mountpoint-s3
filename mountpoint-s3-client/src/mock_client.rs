@@ -112,7 +112,7 @@ impl MockClient {
     }
 
     /// Number of objects in the mock client's bucket
-    pub fn objects_number(&self) -> usize {
+    pub fn object_count(&self) -> usize {
         self.objects.write().unwrap().len()
     }
 

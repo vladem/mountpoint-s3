@@ -105,20 +105,22 @@ mod tests {
     use futures::executor::ThreadPool;
     use mountpoint_s3_client::mock_client::{MockClient, MockClientConfig};
     use mountpoint_s3_client::types::ETag;
+    use tempfile::TempDir;
+    use test_case::test_case;
 
     const PART_SIZE: usize = 8 * 1024 * 1024;
     const BLOCK_SIZE: u64 = 1024 * 1024;
 
-    fn default_disk_cache() -> Arc<DiskDataCache> {
+    fn default_disk_cache() -> (TempDir, Arc<DiskDataCache>) {
         let cache_directory = tempfile::tempdir().unwrap();
         let cache = DiskDataCache::new(
-            cache_directory.into_path(),
+            cache_directory.path().to_path_buf(),
             DiskDataCacheConfig {
                 block_size: BLOCK_SIZE,
                 limit: CacheLimit::Unbounded,
             },
         );
-        Arc::new(cache)
+        (cache_directory, Arc::new(cache))
     }
 
     fn default_express_cache() -> (MockClient, ExpressDataCache<MockClient>) {
@@ -137,9 +139,12 @@ mod tests {
         )
     }
 
+    #[test_case(false, true; "get from local")]
+    #[test_case(true, false; "get from express")]
+    #[test_case(true, true; "both empty")]
     #[tokio::test]
-    async fn test_put_in_both_caches() {
-        let disk_cache = default_disk_cache();
+    async fn test_put_to_both_caches(cleanup_local: bool, cleanup_express: bool) {
+        let (cache_dir, disk_cache) = default_disk_cache();
         let (client, express_cache) = default_express_cache();
         let runtime = ThreadPool::builder().pool_size(1).create().unwrap();
         let cache = MultilevelDataCache::new(disk_cache, express_cache, runtime);
@@ -153,25 +158,34 @@ mod tests {
             .await
             .expect("put should succeed");
 
-        // check it was put to express
-        assert_eq!(client.objects_number(), 1);
+        // clean up caches
+        if cleanup_local {
+            cache_dir.close().expect("should clean up local cache");
+        }
+        if cleanup_express {
+            client.remove_all_objects();
+        }
 
-        // check it was put to local
-        client.remove_all_objects();
+        // check we can retrieve an entry from one of the caches unless both were cleaned up
         let entry = cache
             .get_block(&cache_key, 0, 0)
             .await
-            .expect("cache should be accessible")
-            .expect("cache entry should be returned");
-        assert_eq!(
-            data, entry,
-            "cache entry returned should match original bytes after put"
-        );
+            .expect("cache should be accessible");
+
+        if cleanup_local && cleanup_express {
+            assert!(entry.is_none());
+        } else {
+            assert_eq!(
+                entry.expect("cache entry should be returned"),
+                data,
+                "cache entry returned should match original bytes after put"
+            );
+        }
     }
 
     #[tokio::test]
     async fn test_put_from_express_to_local() {
-        let disk_cache = default_disk_cache();
+        let (_cache_dir, disk_cache) = default_disk_cache();
         let (client, express_cache) = default_express_cache();
 
         let data = ChecksummedBytes::new("Foo".into());
@@ -182,7 +196,7 @@ mod tests {
             .expect("put should succeed");
 
         let runtime = ThreadPool::builder().pool_size(1).create().unwrap();
-        let cache = MultilevelDataCache::new(disk_cache, express_cache, runtime);
+        let cache = MultilevelDataCache::new(disk_cache, express_cache, runtime.clone());
 
         // get from express, put entry in the local cache
         let entry = cache
@@ -218,12 +232,12 @@ mod tests {
             data, entry,
             "cache entry returned should match original bytes after put"
         );
-        assert_eq!(client.objects_number(), 0);
+        assert_eq!(client.object_count(), 0);
     }
 
     #[tokio::test]
     async fn test_get_from_local() {
-        let disk_cache = default_disk_cache();
+        let (_cache_dir, disk_cache) = default_disk_cache();
         let (_, express_cache) = default_express_cache();
 
         let local_data_1 = ChecksummedBytes::new("key in local only".into());
@@ -274,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_from_express() {
-        let disk_cache = default_disk_cache();
+        let (_cache_dir, disk_cache) = default_disk_cache();
         let (_, express_cache) = default_express_cache();
 
         let data = ChecksummedBytes::new("Foo".into());
