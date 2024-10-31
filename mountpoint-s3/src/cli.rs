@@ -310,7 +310,7 @@ pub struct CliArgs {
     #[cfg(feature = "block_size")]
     #[clap(
         long,
-        help = "Size of a cache block in KiB [Default: 1024 (1 MiB) for disk cache, 512 (512 KiB) for S3 Express cache]",
+        help = "Size of a cache block in KiB [Default: 1024 (1 MiB) for disk cache and for S3 Express cache]",
         help_heading = CACHING_OPTIONS_HEADER,
         value_name = "KiB",
         requires = "cache_group",
@@ -435,10 +435,7 @@ impl CliArgs {
         if let Some(kib) = self.cache_block_size {
             return kib * 1024;
         }
-        if self.cache_express_bucket_name().is_some() {
-            return 512 * 1024; // 512 KiB block size - default for express cache
-        }
-        1024 * 1024 // 1 MiB block size - default for disk cache
+        1024 * 1024 // 1 MiB block size - default for disk cache and for express cache
     }
 
     fn cache_express_bucket_name(&self) -> Option<&str> {
@@ -447,6 +444,26 @@ impl CliArgs {
             return Some(bucket_name);
         }
         None
+    }
+
+    fn disk_data_cache_config(&self) -> Option<(&Path, DiskDataCacheConfig)> {
+        match self.cache.as_ref() {
+            Some(path) => {
+                let cache_limit = match self.max_cache_size {
+                    Some(0) => return None,
+                    Some(max_size_in_mib) => CacheLimit::TotalSize {
+                        max_size: (max_size_in_mib * 1024 * 1024) as usize,
+                    },
+                    None => CacheLimit::default(),
+                };
+                let cache_config = DiskDataCacheConfig {
+                    block_size: self.cache_block_size_in_bytes(),
+                    limit: cache_limit,
+                };
+                Some((path.as_path(), cache_config))
+            }
+            None => None,
+        }
     }
 
     /// Generates a logging configuration based on the CLI arguments.
@@ -768,6 +785,36 @@ pub fn create_s3_client(args: &CliArgs) -> anyhow::Result<(S3CrtClient, EventLoo
     Ok((client, runtime, s3_personality))
 }
 
+fn create_disk_cache(
+    cache_dir_path: &Path,
+    cache_config: DiskDataCacheConfig,
+) -> anyhow::Result<(ManagedCacheDir, DiskDataCache)> {
+    let cache_key = env_unstable_cache_key();
+    let managed_cache_dir = ManagedCacheDir::new_from_parent_with_cache_key(cache_dir_path, cache_key)
+        .context("failed to create cache directory")?;
+    let cache_dir_path = managed_cache_dir.as_path_buf();
+    Ok((managed_cache_dir, DiskDataCache::new(cache_dir_path, cache_config)))
+}
+
+fn create_express_cache<Client: ObjectClient + Send + Sync + 'static>(
+    express_bucket_name: &str,
+    source_bucket_name: &str,
+    block_size: u64,
+    client: Client,
+) -> ExpressDataCache<Client> {
+    // bypass express cache for objects larger than 1 MiB
+    const EXPRESS_CACHE_MAX_OBJECT_SIZE: usize = 1024 * 1024;
+    // The cache can be shared across instances mounting the same bucket (including with different prefixes)
+    let source_description = source_bucket_name;
+    ExpressDataCache::new(
+        express_bucket_name,
+        client,
+        source_description,
+        block_size,
+        EXPRESS_CACHE_MAX_OBJECT_SIZE,
+    )
+}
+
 fn mount<ClientBuilder, Client, Runtime>(args: CliArgs, client_builder: ClientBuilder) -> anyhow::Result<FuseSession>
 where
     ClientBuilder: FnOnce(&CliArgs) -> anyhow::Result<(Client, Runtime, S3Personality)>,
@@ -852,102 +899,80 @@ where
     tracing::trace!("using metadata TTL setting {metadata_cache_ttl:?}");
     filesystem_config.cache_config = CacheConfig::new(metadata_cache_ttl);
 
-    let create_disk_cache = |args: &CliArgs| -> anyhow::Result<_> {
-        assert!(args.max_cache_size.is_none() || args.max_cache_size.unwrap() > 0);
-        let path = args.cache.as_ref().expect("cache path must be some");
-        let cache_limit = match args.max_cache_size {
-            Some(max_size_in_mib) => CacheLimit::TotalSize {
-                max_size: (max_size_in_mib * 1024 * 1024) as usize,
-            },
-            None => CacheLimit::default(),
-        };
-        let cache_config = DiskDataCacheConfig {
-            block_size: args.cache_block_size_in_bytes(),
-            limit: cache_limit,
-        };
-        let cache_key = env_unstable_cache_key();
-        let managed_cache_dir = ManagedCacheDir::new_from_parent_with_cache_key(path, cache_key)
-            .context("failed to create cache directory")?;
+    match (args.disk_data_cache_config(), args.cache_express_bucket_name()) {
+        (None, Some(express_bucket_name)) => {
+            tracing::debug!("using express cache");
+            let express_cache = create_express_cache(
+                express_bucket_name,
+                &args.bucket_name,
+                args.cache_block_size_in_bytes(),
+                client.clone(),
+            );
 
-        let cache_dir_path = managed_cache_dir.as_path_buf();
-        Ok((managed_cache_dir, DiskDataCache::new(cache_dir_path, cache_config)))
+            let prefetcher = caching_prefetch(express_cache, runtime, prefetcher_config);
+            let fuse_session = create_filesystem(
+                client,
+                prefetcher,
+                &args.bucket_name,
+                &args.prefix.unwrap_or_default(),
+                filesystem_config,
+                fuse_config,
+                &bucket_description,
+            )?;
+
+            return Ok(fuse_session);
+        }
+        (Some((cache_dir_path, disk_data_cache_config)), None) => {
+            tracing::debug!("using disk cache");
+            let (managed_cache_dir, disk_cache) = create_disk_cache(cache_dir_path, disk_data_cache_config)?;
+
+            let prefetcher = caching_prefetch(disk_cache, runtime, prefetcher_config);
+            let mut fuse_session = create_filesystem(
+                client,
+                prefetcher,
+                &args.bucket_name,
+                &args.prefix.unwrap_or_default(),
+                filesystem_config,
+                fuse_config,
+                &bucket_description,
+            )?;
+
+            fuse_session.run_on_close(Box::new(move || {
+                drop(managed_cache_dir);
+            }));
+
+            return Ok(fuse_session);
+        }
+        (Some((cache_dir_path, disk_data_cache_config)), Some(express_bucket_name)) => {
+            tracing::debug!("using multilevel cache");
+            let (managed_cache_dir, disk_cache) = create_disk_cache(cache_dir_path, disk_data_cache_config)?;
+            let express_cache = create_express_cache(
+                express_bucket_name,
+                &args.bucket_name,
+                args.cache_block_size_in_bytes(),
+                client.clone(),
+            );
+            let cache = MultilevelDataCache::new(Arc::new(disk_cache), express_cache, runtime.clone());
+
+            let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
+            let mut fuse_session = create_filesystem(
+                client,
+                prefetcher,
+                &args.bucket_name,
+                &args.prefix.unwrap_or_default(),
+                filesystem_config,
+                fuse_config,
+                &bucket_description,
+            )?;
+
+            fuse_session.run_on_close(Box::new(move || {
+                drop(managed_cache_dir);
+            }));
+
+            return Ok(fuse_session);
+        }
+        _ => (), // no cache
     };
-
-    let create_express_cache = |args: &CliArgs, client| {
-        let express_bucket_name = args.cache_express_bucket_name().expect("express bucket must be set");
-        // bypass express cache for objects larger than 1 MiB
-        const EXPRESS_CACHE_MAX_OBJECT_SIZE: usize = 1024 * 1024;
-        // The cache can be shared across instances mounting the same bucket (including with different prefixes)
-        let source_description = &args.bucket_name;
-        ExpressDataCache::new(
-            express_bucket_name,
-            client,
-            source_description,
-            args.cache_block_size_in_bytes(),
-            EXPRESS_CACHE_MAX_OBJECT_SIZE,
-        )
-    };
-
-    let cache_size_positive = !matches!(args.max_cache_size, Some(0));
-    if args.cache.is_some() && cache_size_positive && args.cache_express_bucket_name().is_some() {
-        tracing::debug!("using multilevel cache");
-        let (managed_cache_dir, disk_cache) = create_disk_cache(&args)?;
-        let express_cache = create_express_cache(&args, client.clone());
-        let cache = MultilevelDataCache::new(Arc::new(disk_cache), express_cache, runtime.clone());
-
-        let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
-        let mut fuse_session = create_filesystem(
-            client,
-            prefetcher,
-            &args.bucket_name,
-            &args.prefix.unwrap_or_default(),
-            filesystem_config,
-            fuse_config,
-            &bucket_description,
-        )?;
-
-        fuse_session.run_on_close(Box::new(move || {
-            drop(managed_cache_dir);
-        }));
-
-        return Ok(fuse_session);
-    } else if args.cache.is_some() && cache_size_positive {
-        tracing::debug!("using disk cache");
-        let (managed_cache_dir, disk_cache) = create_disk_cache(&args)?;
-
-        let prefetcher = caching_prefetch(disk_cache, runtime, prefetcher_config);
-        let mut fuse_session = create_filesystem(
-            client,
-            prefetcher,
-            &args.bucket_name,
-            &args.prefix.unwrap_or_default(),
-            filesystem_config,
-            fuse_config,
-            &bucket_description,
-        )?;
-
-        fuse_session.run_on_close(Box::new(move || {
-            drop(managed_cache_dir);
-        }));
-
-        return Ok(fuse_session);
-    } else if args.cache_express_bucket_name().is_some() {
-        tracing::debug!("using express cache");
-        let express_cache = create_express_cache(&args, client.clone());
-
-        let prefetcher = caching_prefetch(express_cache, runtime, prefetcher_config);
-        let fuse_session = create_filesystem(
-            client,
-            prefetcher,
-            &args.bucket_name,
-            &args.prefix.unwrap_or_default(),
-            filesystem_config,
-            fuse_config,
-            &bucket_description,
-        )?;
-
-        return Ok(fuse_session);
-    }
 
     let prefetcher = default_prefetch(runtime, prefetcher_config);
     create_filesystem(
