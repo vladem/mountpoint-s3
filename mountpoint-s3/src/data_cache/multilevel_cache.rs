@@ -18,7 +18,15 @@ impl<DiskCache: DataCache, ExpressCache: DataCache, Runtime: Spawn>
     MultilevelDataCache<DiskCache, ExpressCache, Runtime>
 {
     pub fn new(disk_cache: Arc<DiskCache>, express_cache: ExpressCache, runtime: Runtime) -> Self {
-        assert_eq!(disk_cache.block_size(), express_cache.block_size());
+        // Method `MultilevelDataCache::block_size` relies on block sizes of both caches to be equal.
+        // `CachingPartStream`, being the user of cache, uses this method to split S3 object into blocks.
+        // Allowing non-matching block sizes would mean splitting objects in 2 different ways and imply
+        // the different interface for the `MultilevelDataCache`.
+        assert_eq!(
+            disk_cache.block_size(),
+            express_cache.block_size(),
+            "block sizes must be equal"
+        );
         Self {
             disk_cache,
             express_cache,
@@ -52,11 +60,11 @@ where
         if let Some(data) = self.express_cache.get_block(cache_key, block_idx, block_offset).await? {
             trace!(cache_key=?cache_key, block_idx=block_idx, "block served from the express cache");
             let cache_key = cache_key.clone();
-            let cache = self.disk_cache.clone();
+            let disk_cache = self.disk_cache.clone();
             let data_cloned = data.clone();
             self.runtime
                 .spawn(async move {
-                    if let Err(error) = cache
+                    if let Err(error) = disk_cache
                         .put_block(cache_key.clone(), block_idx, block_offset, data_cloned)
                         .await
                     {
@@ -77,13 +85,12 @@ where
         block_offset: u64,
         bytes: ChecksummedBytes,
     ) -> DataCacheResult<()> {
-        match self
+        if let Err(error) = self
             .disk_cache
             .put_block(cache_key.clone(), block_idx, block_offset, bytes.clone())
             .await
         {
-            Ok(_) => (),
-            Err(error) => warn!(cache_key=?cache_key, block_idx, ?error, "failed to update the local cache"),
+            warn!(cache_key=?cache_key, block_idx, ?error, "failed to update the local cache");
         }
 
         self.express_cache
@@ -111,7 +118,7 @@ mod tests {
     const PART_SIZE: usize = 8 * 1024 * 1024;
     const BLOCK_SIZE: u64 = 1024 * 1024;
 
-    fn default_disk_cache() -> (TempDir, Arc<DiskDataCache>) {
+    fn create_disk_cache() -> (TempDir, Arc<DiskDataCache>) {
         let cache_directory = tempfile::tempdir().unwrap();
         let cache = DiskDataCache::new(
             cache_directory.path().to_path_buf(),
@@ -123,7 +130,7 @@ mod tests {
         (cache_directory, Arc::new(cache))
     }
 
-    fn default_express_cache() -> (MockClient, ExpressDataCache<MockClient>) {
+    fn create_express_cache() -> (MockClient, ExpressDataCache<MockClient>) {
         let bucket = "test_bucket";
         let config = MockClientConfig {
             bucket: bucket.to_string(),
@@ -144,8 +151,8 @@ mod tests {
     #[test_case(true, true; "both empty")]
     #[tokio::test]
     async fn test_put_to_both_caches(cleanup_local: bool, cleanup_express: bool) {
-        let (cache_dir, disk_cache) = default_disk_cache();
-        let (client, express_cache) = default_express_cache();
+        let (cache_dir, disk_cache) = create_disk_cache();
+        let (client, express_cache) = create_express_cache();
         let runtime = ThreadPool::builder().pool_size(1).create().unwrap();
         let cache = MultilevelDataCache::new(disk_cache, express_cache, runtime);
 
@@ -185,8 +192,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_from_express_to_local() {
-        let (_cache_dir, disk_cache) = default_disk_cache();
-        let (client, express_cache) = default_express_cache();
+        let (_cache_dir, disk_cache) = create_disk_cache();
+        let (client, express_cache) = create_express_cache();
 
         let data = ChecksummedBytes::new("Foo".into());
         let cache_key = ObjectId::new("a".into(), ETag::for_tests());
@@ -237,8 +244,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_from_local() {
-        let (_cache_dir, disk_cache) = default_disk_cache();
-        let (_, express_cache) = default_express_cache();
+        let (_cache_dir, disk_cache) = create_disk_cache();
+        let (_, express_cache) = create_express_cache();
 
         let local_data_1 = ChecksummedBytes::new("key in local only".into());
         let local_data_2 = ChecksummedBytes::new("key in both, right data".into());
@@ -288,8 +295,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_from_express() {
-        let (_cache_dir, disk_cache) = default_disk_cache();
-        let (_, express_cache) = default_express_cache();
+        let (_cache_dir, disk_cache) = create_disk_cache();
+        let (_, express_cache) = create_express_cache();
 
         let data = ChecksummedBytes::new("Foo".into());
         let cache_key = ObjectId::new("a".into(), ETag::for_tests());

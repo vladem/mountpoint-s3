@@ -901,7 +901,7 @@ where
                 &bucket_description,
             )?;
 
-            return Ok(fuse_session);
+            Ok(fuse_session)
         }
         (Some((cache_dir_path, disk_data_cache_config)), None) => {
             tracing::debug!("using disk cache");
@@ -922,7 +922,7 @@ where
                 drop(managed_cache_dir);
             }));
 
-            return Ok(fuse_session);
+            Ok(fuse_session)
         }
         (Some((cache_dir_path, disk_data_cache_config)), Some(express_bucket_name)) => {
             tracing::debug!("using multilevel cache");
@@ -950,21 +950,22 @@ where
                 drop(managed_cache_dir);
             }));
 
-            return Ok(fuse_session);
+            Ok(fuse_session)
         }
-        _ => (), // no cache
-    };
-
-    let prefetcher = default_prefetch(runtime, prefetcher_config);
-    create_filesystem(
-        client,
-        prefetcher,
-        &args.bucket_name,
-        &args.prefix.unwrap_or_default(),
-        filesystem_config,
-        fuse_config,
-        &bucket_description,
-    )
+        _ => {
+            tracing::debug!("using no cache");
+            let prefetcher = default_prefetch(runtime, prefetcher_config);
+            create_filesystem(
+                client,
+                prefetcher,
+                &args.bucket_name,
+                &args.prefix.unwrap_or_default(),
+                filesystem_config,
+                fuse_config,
+                &bucket_description,
+            )
+        }
+    }
 }
 
 fn create_filesystem<Client, Prefetcher>(
