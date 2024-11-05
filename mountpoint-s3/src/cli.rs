@@ -450,6 +450,7 @@ impl CliArgs {
         match self.cache.as_ref() {
             Some(path) => {
                 let cache_limit = match self.max_cache_size {
+                    // Fallback to no data cache.
                     Some(0) => return None,
                     Some(max_size_in_mib) => CacheLimit::TotalSize {
                         max_size: (max_size_in_mib * 1024 * 1024) as usize,
@@ -882,7 +883,7 @@ where
 
     match (args.disk_data_cache_config(), args.cache_express_bucket_name()) {
         (None, Some(express_bucket_name)) => {
-            tracing::debug!("using express cache");
+            tracing::trace!("using S3 Express One Zone bucket as a cache for object content");
             let express_cache = ExpressDataCache::new(
                 express_bucket_name,
                 client.clone(),
@@ -904,7 +905,7 @@ where
             Ok(fuse_session)
         }
         (Some((cache_dir_path, disk_data_cache_config)), None) => {
-            tracing::debug!("using disk cache");
+            tracing::trace!("using local disk as a cache for object content");
             let (managed_cache_dir, disk_cache) = create_disk_cache(cache_dir_path, disk_data_cache_config)?;
 
             let prefetcher = caching_prefetch(disk_cache, runtime, prefetcher_config);
@@ -925,7 +926,7 @@ where
             Ok(fuse_session)
         }
         (Some((cache_dir_path, disk_data_cache_config)), Some(express_bucket_name)) => {
-            tracing::debug!("using multilevel cache");
+            tracing::trace!("using both local disk and S3 Express One Zone bucket as a cache for object content");
             let (managed_cache_dir, disk_cache) = create_disk_cache(cache_dir_path, disk_data_cache_config)?;
             let express_cache = ExpressDataCache::new(
                 express_bucket_name,
@@ -953,7 +954,7 @@ where
             Ok(fuse_session)
         }
         _ => {
-            tracing::debug!("using no cache");
+            tracing::trace!("using no cache");
             let prefetcher = default_prefetch(runtime, prefetcher_config);
             create_filesystem(
                 client,

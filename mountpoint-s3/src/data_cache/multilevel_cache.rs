@@ -8,6 +8,10 @@ use crate::object::ObjectId;
 
 use super::{BlockIndex, ChecksummedBytes, DataCache, DataCacheResult};
 
+/// A data cache which uses both the local disk and S3 Express One Zone bucket as a storage.
+/// Disk cache is assumed to be faster so this is quiried first on `get_block` requests. An
+/// S3 Express One Zone cache is checked when data is missing on disk. Both caches are
+/// populated on `put_block`.
 pub struct MultilevelDataCache<DiskCache, ExpressCache, Runtime> {
     disk_cache: Arc<DiskCache>,
     express_cache: ExpressCache,

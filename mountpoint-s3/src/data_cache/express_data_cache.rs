@@ -89,8 +89,6 @@ where
                     }
                     buffer.extend_from_slice(&body);
 
-                    // Ensure the flow-control window is large enough.
-                    // TODO: review if/when we add a header to the block.
                     result.as_mut().increment_read_window(self.block_size as usize);
                 }
                 Err(ObjectClientError::ServiceError(GetObjectError::NoSuchKey)) => return Ok(None),
