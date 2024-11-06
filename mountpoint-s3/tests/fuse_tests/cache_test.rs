@@ -69,9 +69,6 @@ fn cache_write_read_base<Cache, CacheFactory>(
     let read = fs::read(&path).expect("read should succeed");
     assert_eq!(read, written);
 
-    // cache population is async, 3 seconds should be enough for it to finish
-    sleep(Duration::from_secs(3));
-
     // ensure data may not be served from the source bucket
     client.remove_object(&key).expect("remove must succeed");
     assert!(
@@ -80,8 +77,18 @@ fn cache_write_read_base<Cache, CacheFactory>(
     );
 
     // second read should be from the cache
-    let read = fs::read(&path).expect("read from the cache should succeed");
-    assert_eq!(read, written);
+    const MAX_WAIT_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+    let st = std::time::Instant::now();
+    loop {
+        if st.elapsed() > MAX_WAIT_DURATION {
+            panic!("timeout on waiting for data being served from the cache")
+        }
+        if let Ok(read) = fs::read(&path) {
+            assert_eq!(read, written);
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
 }
 
 fn express_cache_factory(client: S3CrtClient, block_size: u64) -> ExpressDataCache<S3CrtClient> {
