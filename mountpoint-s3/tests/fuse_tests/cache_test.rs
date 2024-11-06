@@ -69,8 +69,8 @@ fn cache_write_read_base<Cache, CacheFactory>(
     let read = fs::read(&path).expect("read should succeed");
     assert_eq!(read, written);
 
-    // cache population is async, 1 second should be enough for it to finish
-    sleep(Duration::from_secs(1));
+    // cache population is async, 3 seconds should be enough for it to finish
+    sleep(Duration::from_secs(3));
 
     // ensure data may not be served from the source bucket
     client.remove_object(&key).expect("remove must succeed");
