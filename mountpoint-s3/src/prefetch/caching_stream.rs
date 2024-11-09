@@ -354,6 +354,7 @@ where
                 {
                     warn!(key=?object_id, block_index, ?error, "failed to update cache");
                 }
+                metrics::counter!("prefetch.blocks_stored_to_cache").increment(1);
                 metrics::histogram!("prefetch.cache_update_duration_us").record(start.elapsed().as_micros() as f64);
             })
             .unwrap();

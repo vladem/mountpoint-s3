@@ -10,6 +10,8 @@ pub mod fuse;
 #[cfg(feature = "s3_tests")]
 pub mod s3;
 
+pub mod metrics;
+
 use aws_credential_types::Credentials;
 use fuser::{FileAttr, FileType};
 use futures::executor::ThreadPool;

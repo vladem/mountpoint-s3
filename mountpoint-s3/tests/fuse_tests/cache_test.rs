@@ -1,42 +1,69 @@
-use crate::common::fuse::{self, TestSessionConfig};
+use crate::common::fuse;
+use crate::common::metrics::{get_counter_value, TestRecorder};
 use crate::common::s3::{get_express_cache_bucket, get_test_bucket_and_prefix};
 use mountpoint_s3::data_cache::{DataCache, DiskDataCache, DiskDataCacheConfig, ExpressDataCache};
 use mountpoint_s3_client::S3CrtClient;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
+use rusty_fork::rusty_fork_test;
 use std::fs;
 use std::path::PathBuf;
 use std::thread::sleep;
 use std::time::Duration;
-use test_case::test_case;
 
-#[test_case("key", 100, 1024; "simple")]
-#[test_case("£", 100, 1024; "non-ascii key")]
-#[test_case("key", 1024, 1024; "long key")]
-#[test_case("key", 100, 1024 * 1024; "big file")]
-fn express_cache_write_read(key_suffix: &str, key_size: usize, object_size: usize) {
-    cache_write_read_base(
-        key_suffix,
-        key_size,
-        object_size,
-        express_cache_factory,
-        "express_cache_write_read",
-    )
+// The following tests use global metrics registry of the process,
+// so a separate process is spawned for each of the them.
+rusty_fork_test! {
+    #[test]
+    fn express_cache_write_read_non_ascii() {
+        cache_write_read_base(
+            "£",
+            100,
+            1024,
+            express_cache_factory,
+            "express_cache_write_read_non_ascii",
+        );
+    }
 }
 
-#[test_case("key", 100, 1024; "simple")]
-#[test_case("£", 100, 1024; "non-ascii key")]
-#[test_case("key", 1024, 1024; "long key")]
-#[test_case("key", 100, 1024 * 1024; "big file")]
-fn disk_cache_write_read(key_suffix: &str, key_size: usize, object_size: usize) {
-    let cache_dir = tempfile::tempdir().unwrap();
-    cache_write_read_base(
-        key_suffix,
-        key_size,
-        object_size,
-        disk_cache_factory(cache_dir.path().to_owned()),
-        "disk_cache_write_read",
-    );
+rusty_fork_test! {
+    #[test]
+    fn express_cache_write_read_long_key() {
+        cache_write_read_base(
+            "key",
+            1024,
+            1024,
+            express_cache_factory,
+            "express_cache_write_read_long_key",
+        );
+    }
+}
+
+rusty_fork_test! {
+    #[test]
+    fn express_cache_write_read_big_file() {
+        cache_write_read_base(
+            "key",
+            100,
+            1024 * 1024,
+            express_cache_factory,
+            "express_cache_write_read_big_file",
+        );
+    }
+}
+
+rusty_fork_test! {
+    #[test]
+    fn disk_cache_write_read_simple() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        cache_write_read_base(
+            "key",
+            100,
+            1024,
+            disk_cache_factory(cache_dir.path().to_owned()),
+            "disk_cache_write_read_simple",
+        );
+    }
 }
 
 fn cache_write_read_base<Cache, CacheFactory>(
@@ -49,15 +76,17 @@ fn cache_write_read_base<Cache, CacheFactory>(
     Cache: DataCache + Send + Sync + 'static,
     CacheFactory: FnOnce(S3CrtClient, u64) -> Cache,
 {
+    // set up metrics
+    let recorder = TestRecorder::default();
+    metrics::set_global_recorder(recorder.clone()).unwrap();
+    const SERVED_FROM_CACHE_METRIC_NAME: &str = "prefetch.blocks_served_from_cache";
+    const STORED_TO_CACHE_METRIC_NAME: &str = "prefetch.blocks_stored_to_cache";
+
     // mount a bucket
-    const BLOCK_SIZE: u64 = 512 * 1024;
-    let mut test_config: TestSessionConfig = TestSessionConfig::default();
-    test_config.filesystem_config.cache_config.serve_lookup_from_cache = true;
-    test_config.filesystem_config.cache_config.dir_ttl = Duration::from_secs(3600);
-    test_config.filesystem_config.cache_config.file_ttl = Duration::from_secs(3600);
+    const BLOCK_SIZE: u64 = 1024 * 1024;
     let (_, prefix) = get_test_bucket_and_prefix(test_name);
-    let (mount_point, _session, mut client) =
-        fuse::s3_session::new_with_cache_factory(prefix.clone(), cache_factory, test_config, BLOCK_SIZE);
+    let (mount_point, _session, _client) =
+        fuse::s3_session::new_with_cache_factory(prefix.clone(), cache_factory, Default::default(), BLOCK_SIZE);
 
     // write an object, no caching happens yet
     let key = get_object_key(&prefix, key_suffix, key_size);
@@ -69,26 +98,34 @@ fn cache_write_read_base<Cache, CacheFactory>(
     let read = fs::read(&path).expect("read should succeed");
     assert_eq!(read, written);
 
-    // ensure data may not be served from the source bucket
-    client.remove_object(&key).expect("remove must succeed");
-    assert!(
-        !client.contains_key(&key).expect("head object must succeed"),
-        "object should not exist in the source bucket"
-    );
-
-    // second read should be from the cache
+    // cache writes are async, wait for that to happen
     const MAX_WAIT_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
     let st = std::time::Instant::now();
     loop {
         if st.elapsed() > MAX_WAIT_DURATION {
-            panic!("timeout on waiting for data being served from the cache")
+            panic!("timeout on waiting for data being stored to the cache")
         }
-        if let Ok(read) = fs::read(&path) {
-            assert_eq!(read, written);
+        if get_counter_value(&recorder, STORED_TO_CACHE_METRIC_NAME) == Some(1) {
             break;
         }
         sleep(Duration::from_millis(100));
     }
+
+    // ensure there no cache accesses yet
+    if let Some(served_from_cache) = get_counter_value(&recorder, SERVED_FROM_CACHE_METRIC_NAME) {
+        assert_eq!(served_from_cache, 0, "no cache reads are expected yet");
+    }
+
+    // second read should be from the cache
+    let read = fs::read(&path).expect("read from the cache should succeed");
+    assert_eq!(read, written);
+
+    // ensure data was served from the cache
+    assert_eq!(
+        get_counter_value(&recorder, SERVED_FROM_CACHE_METRIC_NAME),
+        Some(1),
+        "the requested object must consist of a single block being served from cache"
+    );
 }
 
 fn express_cache_factory(client: S3CrtClient, block_size: u64) -> ExpressDataCache<S3CrtClient> {

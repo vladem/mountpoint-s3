@@ -2395,6 +2395,7 @@ dependencies = [
  "rand",
  "rand_chacha",
  "regex",
+ "rusty-fork",
  "serde",
  "serde_json",
  "serial_test",
