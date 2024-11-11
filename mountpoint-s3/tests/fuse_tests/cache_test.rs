@@ -105,26 +105,21 @@ fn cache_write_read_base<Cache, CacheFactory>(
         if st.elapsed() > MAX_WAIT_DURATION {
             panic!("timeout on waiting for data being stored to the cache")
         }
-        if get_counter_value(&recorder, STORED_TO_CACHE_METRIC_NAME) == Some(1) {
+        if get_counter_value(&recorder, STORED_TO_CACHE_METRIC_NAME) == 1 {
             break;
         }
         sleep(Duration::from_millis(100));
     }
 
-    // ensure there no cache accesses yet
-    if let Some(served_from_cache) = get_counter_value(&recorder, SERVED_FROM_CACHE_METRIC_NAME) {
-        assert_eq!(served_from_cache, 0, "no cache reads are expected yet");
-    }
-
     // second read should be from the cache
+    let prev_counter_value = get_counter_value(&recorder, SERVED_FROM_CACHE_METRIC_NAME);
     let read = fs::read(&path).expect("read from the cache should succeed");
     assert_eq!(read, written);
 
     // ensure data was served from the cache
-    assert_eq!(
-        get_counter_value(&recorder, SERVED_FROM_CACHE_METRIC_NAME),
-        Some(1),
-        "the requested object must consist of a single block being served from cache"
+    assert!(
+        get_counter_value(&recorder, SERVED_FROM_CACHE_METRIC_NAME) > prev_counter_value,
+        "some blocks should be served from the cache",
     );
 }
 

@@ -128,14 +128,16 @@ impl HistogramFn for Metric {
     }
 }
 
-pub fn get_counter_value(recorder: &TestRecorder, metric_name: &str) -> Option<u64> {
+pub fn get_counter_value(recorder: &TestRecorder, metric_name: &str) -> u64 {
     let metrics = recorder.metrics.lock().unwrap().clone();
 
-    let (_, metric) = metrics.get(metric_name, None, None)?;
+    let Some((_, metric)) = metrics.get(metric_name, None, None) else {
+        return 0;
+    };
 
     let Metric::Counter(metric) = metric else {
         panic!("expected a counter metric: {}", metric_name);
     };
     let value = *metric.lock().unwrap();
-    Some(value)
+    value
 }
