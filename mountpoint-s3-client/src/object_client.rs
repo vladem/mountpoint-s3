@@ -572,6 +572,10 @@ pub trait GetObjectRequest:
     /// Get the object's checksum, if uploaded with one
     async fn get_object_checksum(&self) -> ObjectClientResult<Checksum, GetObjectError, Self::ClientError>;
 
+    async fn get_object_sse(
+        &self,
+    ) -> ObjectClientResult<(Option<String>, Option<String>), GetObjectError, Self::ClientError>;
+
     /// Increment the flow-control window, so that response data continues downloading.
     ///
     /// If the client was created with `enable_read_backpressure` set true,

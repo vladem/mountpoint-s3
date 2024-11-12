@@ -355,6 +355,24 @@ pub struct CliArgs {
 
     #[clap(
         long,
+        help = "Server-side encryption algorithm to use when uploading new objects",
+        help_heading = BUCKET_OPTIONS_HEADER,
+        requires = "cache_express", // TODO: is the kms key ID required for aws:kms?
+        value_parser = clap::builder::PossibleValuesParser::new(["aws:kms", "AES256"]))]
+    pub cache_sse: Option<String>,
+
+    #[clap(
+        long,
+        help = "AWS Key Management Service (KMS) key ARN to use with KMS server-side encryption when uploading new objects. Key ID, Alias and Alias ARN are all not supported.",
+        help_heading = BUCKET_OPTIONS_HEADER,
+        requires_all = ["cache_sse", "cache_express"],
+        value_parser = parse_kms_key_arn,
+        value_name = "AWS_KMS_KEY_ARN",
+    )]
+    pub cache_sse_kms_key_id: Option<String>,
+
+    #[clap(
+        long,
         help = "Checksum algorithm to use for S3 uploads [default: crc32c]",
         help_heading = BUCKET_OPTIONS_HEADER,
         value_name = "ALGORITHM",
@@ -818,6 +836,7 @@ where
 
     validate_mount_point(&args.mount_point)?;
     validate_sse_args(args.sse.as_deref(), args.sse_kms_key_id.as_deref())?;
+    validate_sse_args(args.cache_sse.as_deref(), args.cache_sse_kms_key_id.as_deref())?; // TODO: print another message
 
     let (client, runtime, s3_personality) = client_builder(&args)?;
 
@@ -894,7 +913,13 @@ where
     match (args.disk_data_cache_config(), args.express_data_cache_config()) {
         (None, Some((config, bucket_name, cache_bucket_name))) => {
             tracing::trace!("using S3 Express One Zone bucket as a cache for object content");
-            let express_cache = ExpressDataCache::new(client.clone(), config, bucket_name, cache_bucket_name);
+            let express_cache = ExpressDataCache::new(
+                client.clone(),
+                config,
+                bucket_name,
+                cache_bucket_name,
+                ServerSideEncryption::new(args.cache_sse.clone(), args.cache_sse_kms_key_id.clone()),
+            );
 
             let prefetcher = caching_prefetch(express_cache, runtime, prefetcher_config);
             let fuse_session = create_filesystem(
@@ -933,7 +958,13 @@ where
         (Some((disk_data_cache_config, cache_dir_path)), Some((config, bucket_name, cache_bucket_name))) => {
             tracing::trace!("using both local disk and S3 Express One Zone bucket as a cache for object content");
             let (managed_cache_dir, disk_cache) = create_disk_cache(cache_dir_path, disk_data_cache_config)?;
-            let express_cache = ExpressDataCache::new(client.clone(), config, bucket_name, cache_bucket_name);
+            let express_cache = ExpressDataCache::new(
+                client.clone(),
+                config,
+                bucket_name,
+                cache_bucket_name,
+                ServerSideEncryption::new(args.cache_sse.clone(), args.cache_sse_kms_key_id.clone()),
+            );
             let cache = MultilevelDataCache::new(Arc::new(disk_cache), express_cache, runtime.clone());
 
             let prefetcher = caching_prefetch(cache, runtime, prefetcher_config);
