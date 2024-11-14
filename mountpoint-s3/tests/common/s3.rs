@@ -131,3 +131,12 @@ pub fn deny_single_object_access_policy(bucket: &str, key: &str) -> String {
     }"#;
     template.replace("__BUCKET__", bucket).replace("__KEY__", key)
 }
+
+pub fn get_bucket_owner() -> String {
+    std::env::var("S3_BUCKET_OWNER").expect("Set S3_BUCKET_OWNER to run integration tests")
+}
+
+pub fn get_external_express_bucket() -> String {
+    std::env::var("S3_EXPRESS_ONE_ZONE_BUCKET_NAME_EXTERNAL")
+        .expect("Set S3_EXPRESS_ONE_ZONE_BUCKET_NAME_EXTERNAL to run integration tests")
+}
