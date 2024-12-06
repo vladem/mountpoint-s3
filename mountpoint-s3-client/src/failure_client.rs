@@ -227,6 +227,10 @@ impl<Client: ObjectClient + Send + Sync, FailState: Send + Sync> GetObjectRespon
         self.request.get_object_checksum()
     }
 
+    fn get_object_sse(&self) -> (Option<String>, Option<String>) {
+        self.request.get_object_sse()
+    }
+
     fn increment_read_window(self: Pin<&mut Self>, len: usize) {
         let this = self.project();
         this.request.increment_read_window(len);

@@ -517,3 +517,58 @@ async fn test_get_object_checksum_checksums_disabled() {
         .get_object_checksum()
         .expect_err("should not return a checksum object as not requested");
 }
+
+#[test_case("aws:kms", Some(get_test_kms_key_id()))]
+#[test_case("aws:kms:dsse", Some(get_test_kms_key_id()))]
+#[test_case("AES256", None)]
+#[tokio::test]
+#[cfg(not(feature = "s3express_tests"))]
+async fn test_get_object_sse(sse_type: &str, kms_key_id: Option<String>) {
+    test_get_object_sse_base(sse_type, kms_key_id, get_test_bucket()).await;
+}
+
+// We have a separate set of tests for express because:
+// 1. via SDK / CRT we can only put an object with the settings that match bucket's defaults:
+//      https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-express-specifying-kms-encryption.html
+// 2. Express doesn't currently support `aws:kms:dsse`.
+#[test_case("aws:kms", Some(get_test_kms_key_id()), get_express_sse_kms_bucket())]
+#[test_case("AES256", None, get_express_bucket())]
+#[tokio::test]
+#[cfg(feature = "s3express_tests")]
+async fn test_get_object_sse(sse_type: &str, kms_key_id: Option<String>, bucket: String) {
+    test_get_object_sse_base(sse_type, kms_key_id, bucket).await;
+}
+
+async fn test_get_object_sse_base(sse_type: &str, kms_key_id: Option<String>, bucket: String) {
+    // Put an object with the desired SSE
+    let sdk_client = get_test_sdk_client().await;
+    let prefix = get_unique_test_prefix("test_get_object_sse");
+    let key = format!("{prefix}/test");
+    let body = vec![0x42; 42];
+    let mut request = sdk_client
+        .put_object()
+        .bucket(&bucket)
+        .key(&key)
+        .body(ByteStream::from(body.clone()))
+        .server_side_encryption(sse_type.into());
+    if let Some(kms_key_id) = kms_key_id.as_ref() {
+        request = request.ssekms_key_id(kms_key_id)
+    }
+    request.send().await.unwrap();
+
+    // Get an object and check that the returned SSE matches the expected
+    let client: S3CrtClient = get_test_client();
+    let result = client
+        .get_object(
+            &bucket,
+            &key,
+            &GetObjectParams::new(),
+        )
+        .await
+        .expect("get_object should succeed");
+    let (received_sse, received_key_id) = result.get_object_sse();
+    assert_eq!(received_sse.expect("sse type must be some"), sse_type);
+    if let Some(kms_key_id) = kms_key_id {
+        assert_eq!(received_key_id.expect("sse key must be some"), kms_key_id);
+    }
+}

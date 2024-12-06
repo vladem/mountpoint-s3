@@ -78,6 +78,13 @@ impl GetObjectResponse for ThroughputGetObjectRequest {
         Ok(self.request.object.checksum.clone())
     }
 
+    fn get_object_sse(&self) -> (Option<String>, Option<String>) {
+        (
+            self.request.object.sse_type.clone(),
+            self.request.object.sse_kms_key_id.clone(),
+        )
+    }
+
     fn increment_read_window(self: Pin<&mut Self>, len: usize) {
         let this = self.project();
         this.request.increment_read_window(len);

@@ -491,6 +491,8 @@ pub struct MockObject {
     ///
     /// Typically, at most one of the checksums should be set.
     checksum: Checksum,
+    sse_type: Option<String>,
+    sse_kms_key_id: Option<String>,
 }
 
 impl MockObject {
@@ -511,6 +513,8 @@ impl MockObject {
             parts: None,
             object_metadata: HashMap::new(),
             checksum: Checksum::empty(),
+            sse_type: None,
+            sse_kms_key_id: None,
         }
     }
 
@@ -525,6 +529,8 @@ impl MockObject {
             parts: None,
             object_metadata: HashMap::new(),
             checksum: Checksum::empty(),
+            sse_type: None,
+            sse_kms_key_id: None,
         }
     }
 
@@ -549,6 +555,8 @@ impl MockObject {
             parts: None,
             object_metadata: HashMap::new(),
             checksum: Checksum::empty(),
+            sse_type: None,
+            sse_kms_key_id: None,
         }
     }
 
@@ -704,6 +712,10 @@ impl GetObjectResponse for MockGetObjectResponse {
 
     fn get_object_checksum(&self) -> Result<Checksum, ObjectChecksumError> {
         Ok(self.object.checksum.clone())
+    }
+
+    fn get_object_sse(&self) -> (Option<String>, Option<String>) {
+        (self.object.sse_type.clone(), self.object.sse_kms_key_id.clone())
     }
 
     fn increment_read_window(mut self: Pin<&mut Self>, len: usize) {

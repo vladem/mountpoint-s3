@@ -12,6 +12,7 @@ use mountpoint_s3_crt::http::request_response::{Header, Headers};
 use mountpoint_s3_crt::s3::client::MetaRequestResult;
 use pin_project::pin_project;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::object_client::{
     Checksum, GetBodyPart, GetObjectError, GetObjectParams, ObjectClientError, ObjectClientResult, ObjectMetadata,
@@ -189,6 +190,27 @@ impl GetObjectResponse for S3GetObjectResponse {
         }
 
         parse_checksum(&self.headers).map_err(|e| ObjectChecksumError::HeadersError(Box::new(e)))
+    }
+
+    fn get_object_sse(&self) -> (Option<String>, Option<String>) {
+        let sse_type = self
+            .headers
+            .get_as_optional_string("x-amz-server-side-encryption")
+            .inspect_err(|err| warn!(?err, "failed to parse x-amz-server-side-encryption header"))
+            .ok()
+            .flatten();
+        let sse_kms_key_id = self
+            .headers
+            .get_as_optional_string("x-amz-server-side-encryption-aws-kms-key-id")
+            .inspect_err(|err| {
+                warn!(
+                    ?err,
+                    "failed to parse x-amz-server-side-encryption-aws-kms-key-id header"
+                )
+            })
+            .ok()
+            .flatten();
+        (sse_type, sse_kms_key_id)
     }
 
     fn increment_read_window(mut self: Pin<&mut Self>, len: usize) {
