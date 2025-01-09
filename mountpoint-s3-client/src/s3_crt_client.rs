@@ -304,7 +304,7 @@ impl S3CrtClientInner {
     fn new(config: S3ClientConfig) -> Result<Self, NewClientError> {
         let allocator = Allocator::default();
 
-        let mut event_loop_group = EventLoopGroup::new_default(&allocator, None, || {}).unwrap();
+        let mut event_loop_group = EventLoopGroup::new_default(&allocator, Some(48), || {}).unwrap();
 
         let resolver_options = HostResolverDefaultOptions {
             max_entries: 8,
