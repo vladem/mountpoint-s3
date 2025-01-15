@@ -644,7 +644,7 @@ pub enum ObjectChecksumError {
 
 /// A single element of a [`get_object`](ObjectClient::get_object) response stream is a pair of
 /// offset within the object and the bytes starting at that offset.
-pub type GetBodyPart = (u64, Box<[u8]>);
+pub type GetBodyPart = (u64, bytes::Bytes);
 
 /// A streaming put request which allows callers to asynchronously write the body of the request.
 ///

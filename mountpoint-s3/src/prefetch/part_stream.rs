@@ -178,7 +178,7 @@ where
     }
 }
 
-pub type RequestReaderOutput<E> = Result<(u64, Box<[u8]>), PrefetchReadError<E>>;
+pub type RequestReaderOutput<E> = Result<(u64, Bytes), PrefetchReadError<E>>;
 
 impl<Runtime> ObjectPartStream for ClientPartStream<Runtime>
 where
@@ -266,10 +266,10 @@ where
     ) -> Result<(), PrefetchReadError<E>> {
         pin_mut!(request_stream);
         while let Some(next) = request_stream.next().await {
-            let (offset, body) = next?;
+            let (offset, mut body) = next?;
             // pre-split the body into multiple parts as suggested by preferred part size
             // in order to avoid validating checksum on large parts at read.
-            let mut body: Bytes = body.into();
+            // let mut body: Bytes = Bytes::from(body);
             let mut curr_offset = offset;
             let alignment = self.preferred_part_size;
             while !body.is_empty() {
