@@ -88,7 +88,7 @@ fn main() {
     let client = S3CrtClient::new(
         S3ClientConfig::new()
             .endpoint_config(EndpointConfig::new(region))
-            .throughput_target_gbps(50.0)
+            .throughput_target_gbps(50.0),
     )
     .expect("couldn't create client");
 

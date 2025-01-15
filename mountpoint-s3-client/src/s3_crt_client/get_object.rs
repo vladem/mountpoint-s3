@@ -12,13 +12,14 @@ use futures::future::FusedFuture;
 use futures::{select_biased, Stream};
 use mountpoint_s3_crt::http::request_response::{Header, Headers};
 use mountpoint_s3_crt::s3::client::{MetaRequest, MetaRequestResult};
-use pin_project::pin_project;
+use pin_project::{pin_project, pinned_drop};
 use thiserror::Error;
 
 use crate::object_client::{
     Checksum, ClientBackpressureHandle, GetBodyPart, GetObjectError, GetObjectParams, ObjectClientError,
     ObjectClientResult, ObjectMetadata,
 };
+use crate::part_pool::PartPool;
 use crate::s3_crt_client::{
     parse_checksum, GetObjectResponse, S3CrtClient, S3CrtClientInner, S3HttpRequest, S3Operation, S3RequestError,
 };
@@ -41,6 +42,7 @@ impl S3CrtClient {
         let (part_sender, part_receiver) = futures::channel::mpsc::unbounded();
         let (headers_sender, mut headers_receiver) = futures::channel::oneshot::channel();
 
+        let part_pool = PartPool::new(self.inner.read_part_size);
         let mut request = {
             let span =
                 request_span!(self.inner, "get_object", bucket, key, range=?params.range, if_match=?params.if_match);
@@ -87,6 +89,7 @@ impl S3CrtClient {
 
             let mut headers_sender = Some(headers_sender);
 
+            let part_acquirer = part_pool.clone();
             self.inner.make_meta_request_from_options(
                 options,
                 span,
@@ -105,7 +108,8 @@ impl S3CrtClient {
                     }
                 },
                 move |offset, data| {
-                    let _ = part_sender.unbounded_send((offset, data.into()));
+                    let data = part_acquirer.acquire_part(data);
+                    let _ = part_sender.unbounded_send((offset, data));
                 },
                 move |result| {
                     if result.is_err() {
@@ -146,6 +150,7 @@ impl S3CrtClient {
             backpressure_handle,
             headers,
             next_offset,
+            part_pool,
         })
     }
 }
@@ -187,7 +192,7 @@ impl ClientBackpressureHandle for S3BackpressureHandle {
 /// Each item of the stream is a part of the object body together with the part's offset within the
 /// object.
 #[derive(Debug)]
-#[pin_project]
+#[pin_project(PinnedDrop)]
 pub struct S3GetObjectResponse {
     #[pin]
     request: S3HttpRequest<(), GetObjectError>,
@@ -198,6 +203,15 @@ pub struct S3GetObjectResponse {
     headers: Headers,
     /// Next offset of the data to be polled from [poll_next]
     next_offset: u64,
+    part_pool: PartPool,
+}
+
+#[pinned_drop]
+impl PinnedDrop for S3GetObjectResponse {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        this.part_pool.drain();
+    }
 }
 
 #[cfg_attr(not(docsrs), async_trait)]
