@@ -17,6 +17,7 @@ use futures::task::Spawn;
 use mountpoint_s3_client::config::{AddressingStyle, EndpointConfig, S3ClientAuthConfig, S3ClientConfig};
 use mountpoint_s3_client::error::ObjectClientError;
 use mountpoint_s3_client::instance_info::InstanceInfo;
+use mountpoint_s3_client::part_pool::PartPool;
 use mountpoint_s3_client::user_agent::UserAgent;
 use mountpoint_s3_client::{ObjectClient, S3CrtClient, S3RequestError};
 use mountpoint_s3_crt::auth::signing_config::SigningAlgorithm;
@@ -1221,7 +1222,8 @@ fn create_client_for_bucket(
         endpoint_config = endpoint_config.endpoint(endpoint_uri);
     }
 
-    let client = S3CrtClient::new(client_config.clone().endpoint_config(endpoint_config.clone()))?;
+    let part_pool = PartPool::new(client_config.read_part_size);
+    let client = S3CrtClient::new(client_config.clone().endpoint_config(endpoint_config.clone()), part_pool)?;
 
     let list_request = client.list_objects(bucket, None, "", 0, prefix.as_str());
     match futures::executor::block_on(list_request) {
@@ -1229,7 +1231,8 @@ fn create_client_for_bucket(
         // Don't try to automatically correct the region if it was manually specified incorrectly
         Err(ObjectClientError::ClientError(S3RequestError::IncorrectRegion(region))) if !user_provided_region => {
             tracing::warn!("bucket {bucket} is in region {region}, not {region_to_try}. redirecting...");
-            let new_client = S3CrtClient::new(client_config.endpoint_config(endpoint_config.region(&region)))?;
+            let part_pool = PartPool::new(client_config.read_part_size);
+            let new_client = S3CrtClient::new(client_config.endpoint_config(endpoint_config.region(&region)), part_pool)?;
             let list_request = new_client.list_objects(bucket, None, "", 0, prefix.as_str());
             futures::executor::block_on(list_request)
                 .map(|_| new_client)

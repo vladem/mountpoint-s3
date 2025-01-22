@@ -748,7 +748,7 @@ impl Stream for MockGetObjectResponse {
         }
         let next_part = self.object.read(self.next_offset, next_read_size);
 
-        let result = (self.next_offset, next_part);
+        let result = (self.next_offset, next_part.into());
         self.next_offset += next_read_size as u64;
         self.length -= next_read_size;
         Poll::Ready(Some(Ok(result)))

@@ -58,7 +58,7 @@ mod s3_crt_client;
 pub mod user_agent;
 
 pub mod error_metadata;
-mod part_pool;
+pub mod part_pool;
 
 pub use object_client::{ObjectClient, PutObjectRequest};
 

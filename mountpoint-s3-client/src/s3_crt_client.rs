@@ -43,6 +43,7 @@ use crate::endpoint_config::EndpointError;
 use crate::endpoint_config::{self, EndpointConfig};
 use crate::error_metadata::{ClientErrorMetadata, ProvideErrorMetadata};
 use crate::object_client::*;
+use crate::part_pool::PartPool;
 use crate::user_agent::UserAgent;
 
 macro_rules! request_span {
@@ -92,7 +93,7 @@ macro_rules! event {
 pub struct S3ClientConfig {
     auth_config: S3ClientAuthConfig,
     throughput_target_gbps: f64,
-    read_part_size: usize,
+    pub read_part_size: usize,
     write_part_size: usize,
     endpoint_config: EndpointConfig,
     user_agent: Option<UserAgent>,
@@ -262,9 +263,9 @@ pub struct S3CrtClient {
 
 impl S3CrtClient {
     /// Construct a new S3 client with the given configuration.
-    pub fn new(config: S3ClientConfig) -> Result<Self, NewClientError> {
+    pub fn new(config: S3ClientConfig, part_pool: PartPool) -> Result<Self, NewClientError> {
         Ok(Self {
-            inner: Arc::new(S3CrtClientInner::new(config)?),
+            inner: Arc::new(S3CrtClientInner::new(config, part_pool)?),
         })
     }
 
@@ -298,10 +299,11 @@ struct S3CrtClientInner {
     credentials_provider: Option<CredentialsProvider>,
     host_resolver: HostResolver,
     telemetry_callback: Option<Arc<dyn OnTelemetry>>,
+    part_pool: PartPool,
 }
 
 impl S3CrtClientInner {
-    fn new(config: S3ClientConfig) -> Result<Self, NewClientError> {
+    fn new(config: S3ClientConfig, part_pool: PartPool) -> Result<Self, NewClientError> {
         let allocator = Allocator::default();
 
         let mut event_loop_group = EventLoopGroup::new_default(&allocator, Some(48), || {}).unwrap();
@@ -433,6 +435,7 @@ impl S3CrtClientInner {
             credentials_provider: Some(credentials_provider),
             host_resolver,
             telemetry_callback: config.telemetry_callback,
+            part_pool,
         })
     }
 

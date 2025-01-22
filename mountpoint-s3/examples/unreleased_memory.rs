@@ -13,6 +13,7 @@ use sysinfo::{get_current_pid, MemoryRefreshKind, ProcessRefreshKind, ProcessesT
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use mountpoint_s3_client::part_pool::PartPool;
 
 /// Like `tracing_subscriber::fmt::init` but sends logs to stderr
 fn init_tracing_subscriber() {
@@ -85,10 +86,13 @@ fn main() {
         configure_malloc();
     }
 
+    let config = S3ClientConfig::new()
+        .endpoint_config(EndpointConfig::new(region))
+        .throughput_target_gbps(50.0);
+    let part_pool = PartPool::new(config.read_part_size);
     let client = S3CrtClient::new(
-        S3ClientConfig::new()
-            .endpoint_config(EndpointConfig::new(region))
-            .throughput_target_gbps(50.0),
+        config,
+        part_pool,
     )
     .expect("couldn't create client");
 
