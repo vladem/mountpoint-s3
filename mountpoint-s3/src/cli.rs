@@ -1223,7 +1223,10 @@ fn create_client_for_bucket(
     }
 
     let part_pool = PartPool::new(client_config.read_part_size);
-    let client = S3CrtClient::new(client_config.clone().endpoint_config(endpoint_config.clone()), part_pool)?;
+    let client = S3CrtClient::new(
+        client_config.clone().endpoint_config(endpoint_config.clone()),
+        part_pool,
+    )?;
 
     let list_request = client.list_objects(bucket, None, "", 0, prefix.as_str());
     match futures::executor::block_on(list_request) {
@@ -1232,7 +1235,10 @@ fn create_client_for_bucket(
         Err(ObjectClientError::ClientError(S3RequestError::IncorrectRegion(region))) if !user_provided_region => {
             tracing::warn!("bucket {bucket} is in region {region}, not {region_to_try}. redirecting...");
             let part_pool = PartPool::new(client_config.read_part_size);
-            let new_client = S3CrtClient::new(client_config.endpoint_config(endpoint_config.region(&region)), part_pool)?;
+            let new_client = S3CrtClient::new(
+                client_config.endpoint_config(endpoint_config.region(&region)),
+                part_pool,
+            )?;
             let list_request = new_client.list_objects(bucket, None, "", 0, prefix.as_str());
             futures::executor::block_on(list_request)
                 .map(|_| new_client)

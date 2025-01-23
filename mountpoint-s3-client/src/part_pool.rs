@@ -1,5 +1,8 @@
 use bytes::Bytes;
 use crossbeam::queue::SegQueue;
+use libc::{mmap, munmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+use std::ffi::c_void;
+use std::ptr;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -21,9 +24,9 @@ impl PartPool {
             memory_block
         } else {
             metrics::counter!("memory_blocks.allocated").increment(1);
-            vec![0u8; self.part_size]
+            MemoryBlock::new(self.part_size)
         };
-        memory_block[..data.len()].copy_from_slice(data);
+        memory_block.fill(data);
         let part = Part {
             memory_block: Some(memory_block),
             len: data.len(),
@@ -32,9 +35,10 @@ impl PartPool {
         Bytes::from_owner(part)
     }
 
-    pub fn drain(&self) {
-        while let Some(_) = self.free_parts.pop() {}
-    }
+    // pub fn drain(&self) {
+    //     while let Some(_) = self.free_parts.pop() {}
+    // }
+
     // pub fn allocate_parts(&self, parts_num: usize) {
     //     for _ in 0..parts_num {
     //         self.free_parts.push(vec![0u8; self.part_size]);
@@ -48,24 +52,75 @@ impl PartPool {
     // }
 }
 
+struct MemoryBlock {
+    ptr: *mut c_void,
+    size: usize,
+}
+
+unsafe impl Send for MemoryBlock {}
+
+impl Drop for MemoryBlock {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(self.ptr, self.size);
+        }
+    }
+}
+
+impl AsMut<[u8]> for MemoryBlock {
+    fn as_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.size) }
+    }
+}
+
+impl AsRef<[u8]> for MemoryBlock {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *mut u8, self.size) }
+    }
+}
+
+impl MemoryBlock {
+    fn new(size: usize) -> Self {
+        let ptr = unsafe {
+            let ptr = mmap(
+                ptr::null_mut(),
+                size,
+                PROT_READ | PROT_WRITE, // Read and write permissions
+                MAP_ANONYMOUS | MAP_PRIVATE,
+                -1,
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                panic!("Memory allocation failed");
+            }
+            ptr
+        };
+        Self { ptr, size }
+    }
+
+    fn fill(&mut self, data: &[u8]) {
+        self.as_mut()[..data.len()].copy_from_slice(data);
+    }
+}
+
 pub struct Part {
     memory_block: Option<MemoryBlock>,
     len: usize,
     free_parts: Arc<SegQueue<MemoryBlock>>,
 }
 
-type MemoryBlock = Vec<u8>;
-
 impl Drop for Part {
     fn drop(&mut self) {
-        // return part to the pool
-        self.free_parts
-            .push(self.memory_block.take().expect("part should not be dropped"));
+        let memory_block = self.memory_block.take().expect("part should not be dropped");
+        // return part to the pool, trying to make the size of it less than 8GIB
+        if self.free_parts.len() < 1024 {
+            self.free_parts.push(memory_block);
+        }
     }
 }
 
 impl AsRef<[u8]> for Part {
     fn as_ref(&self) -> &[u8] {
-        &self.memory_block.as_ref().expect("part should not be dropped")[..self.len]
+        &self.memory_block.as_ref().expect("part should not be dropped").as_ref()[..self.len]
     }
 }

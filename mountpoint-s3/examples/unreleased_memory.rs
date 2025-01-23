@@ -5,6 +5,7 @@ use clap::{Arg, Command};
 use futures::StreamExt;
 use humansize::format_size;
 use mountpoint_s3_client::config::{EndpointConfig, S3ClientConfig};
+use mountpoint_s3_client::part_pool::PartPool;
 use mountpoint_s3_client::types::GetObjectParams;
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
 use mountpoint_s3_crt::common::rust_log_adapter::RustLogAdapter;
@@ -13,7 +14,6 @@ use sysinfo::{get_current_pid, MemoryRefreshKind, ProcessRefreshKind, ProcessesT
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use mountpoint_s3_client::part_pool::PartPool;
 
 /// Like `tracing_subscriber::fmt::init` but sends logs to stderr
 fn init_tracing_subscriber() {
@@ -25,16 +25,6 @@ fn init_tracing_subscriber() {
         .finish();
 
     subscriber.try_init().expect("unable to install global subscriber");
-}
-
-fn configure_malloc() {
-    unsafe {
-        println!(
-            "glibc version: {:?}",
-            std::ffi::CStr::from_ptr(libc::gnu_get_libc_version())
-        );
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 131072); // disable dynamic MMAP_THRESHOLD
-    }
 }
 
 /// Creates requests sequentially and reads from each of them the specified number of bytes.
@@ -56,10 +46,10 @@ fn main() {
                 .value_parser(clap::value_parser!(u64)),
         )
         .arg(
-            Arg::new("tune-malloc")
-                .long("tune-malloc")
-                .default_value("false")
-                .value_parser(clap::value_parser!(bool)),
+            Arg::new("part-size")
+                .long("part-size")
+                .default_value("8388608")
+                .value_parser(clap::value_parser!(u64)),
         )
         .arg(
             Arg::new("range")
@@ -73,7 +63,8 @@ fn main() {
     let key = matches.get_one::<String>("key").unwrap();
     let region = matches.get_one::<String>("region").unwrap();
     let requests = matches.get_one::<u64>("requests").unwrap();
-    let tune_malloc = matches.get_one::<bool>("tune-malloc").unwrap();
+    let part_size = matches.get_one::<u64>("part-size").unwrap();
+    let part_size = *part_size as usize;
     let range = matches.get_one::<String>("range").map(|s| {
         let range_regex = Regex::new(r"^(?P<start>[0-9]+)-(?P<end>[0-9]+)$").unwrap();
         let matches = range_regex.captures(s).expect("invalid range");
@@ -82,19 +73,13 @@ fn main() {
         // bytes range is inclusive, but the `Range` type is exclusive, so bump the end by 1
         start..(end + 1)
     });
-    if *tune_malloc {
-        configure_malloc();
-    }
 
     let config = S3ClientConfig::new()
         .endpoint_config(EndpointConfig::new(region))
-        .throughput_target_gbps(50.0);
-    let part_pool = PartPool::new(config.read_part_size);
-    let client = S3CrtClient::new(
-        config,
-        part_pool,
-    )
-    .expect("couldn't create client");
+        .throughput_target_gbps(50.0)
+        .part_size(part_size);
+    let part_pool = PartPool::new(part_size);
+    let client = S3CrtClient::new(config, part_pool).expect("couldn't create client");
 
     let received_bytes_counter = Arc::new(AtomicU64::new(0));
     let received_bytes_counter_writer = received_bytes_counter.clone();
@@ -130,7 +115,7 @@ fn main() {
         drop(client);
     });
     println!("dropped the client, sleeping");
-    std::thread::sleep(std::time::Duration::from_secs(6));
+    // std::thread::sleep(std::time::Duration::from_secs(6));
 }
 
 fn print_statistics(sys: &mut System, received_bytes_counter: Arc<AtomicU64>) {

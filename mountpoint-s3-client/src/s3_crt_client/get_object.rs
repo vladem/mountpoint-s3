@@ -12,7 +12,7 @@ use futures::future::FusedFuture;
 use futures::{select_biased, Stream};
 use mountpoint_s3_crt::http::request_response::{Header, Headers};
 use mountpoint_s3_crt::s3::client::{MetaRequest, MetaRequestResult};
-use pin_project::{pin_project, pinned_drop};
+use pin_project::pin_project;
 use thiserror::Error;
 
 use crate::object_client::{
@@ -190,7 +190,6 @@ impl ClientBackpressureHandle for S3BackpressureHandle {
 /// Each item of the stream is a part of the object body together with the part's offset within the
 /// object.
 #[derive(Debug)]
-// #[pin_project(PinnedDrop)]
 #[pin_project]
 pub struct S3GetObjectResponse {
     #[pin]
@@ -203,14 +202,6 @@ pub struct S3GetObjectResponse {
     /// Next offset of the data to be polled from [poll_next]
     next_offset: u64,
 }
-
-// #[pinned_drop]
-// impl PinnedDrop for S3GetObjectResponse {
-//     fn drop(self: Pin<&mut Self>) {
-//         let this = self.project();
-//         this.part_pool.drain();
-//     }
-// }
 
 #[cfg_attr(not(docsrs), async_trait)]
 impl GetObjectResponse for S3GetObjectResponse {
