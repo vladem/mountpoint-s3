@@ -5,7 +5,6 @@ use clap::{Arg, Command};
 use futures::StreamExt;
 use humansize::format_size;
 use mountpoint_s3_client::config::{EndpointConfig, S3ClientConfig};
-use mountpoint_s3_client::part_pool::PartPool;
 use mountpoint_s3_client::types::GetObjectParams;
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
 use mountpoint_s3_crt::common::rust_log_adapter::RustLogAdapter;
@@ -14,6 +13,7 @@ use sysinfo::{get_current_pid, MemoryRefreshKind, ProcessRefreshKind, ProcessesT
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use std::time::Instant;
 
 /// Like `tracing_subscriber::fmt::init` but sends logs to stderr
 fn init_tracing_subscriber() {
@@ -76,18 +76,25 @@ fn main() {
 
     let config = S3ClientConfig::new()
         .endpoint_config(EndpointConfig::new(region))
-        .throughput_target_gbps(50.0)
         .part_size(part_size);
-    let part_pool = PartPool::new(part_size);
+
+    let part_pool = mountpoint_s3_client::part_pool::PartPool::new(part_size);
+    println!("Using part pool");
     let client = S3CrtClient::new(config, part_pool).expect("couldn't create client");
 
+    // println!("Not using part pool");
+    // let client = S3CrtClient::new(config).expect("couldn't create client");
+
+    let start = Instant::now();
+    let start_clone = start.clone();
     let received_bytes_counter = Arc::new(AtomicU64::new(0));
+    let received_bytes_counter_reader = received_bytes_counter.clone();
     let received_bytes_counter_writer = received_bytes_counter.clone();
     std::thread::spawn(move || {
         let mut sys = System::new();
         loop {
-            print_statistics(&mut sys, received_bytes_counter.clone());
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            print_statistics(&mut sys, received_bytes_counter_reader.clone(), &start_clone);
+            std::thread::sleep(std::time::Duration::from_secs(10));
         }
     });
     futures::executor::block_on(async move {
@@ -114,27 +121,20 @@ fn main() {
         // explicitly drop the client
         drop(client);
     });
-    println!("dropped the client, sleeping");
-    // std::thread::sleep(std::time::Duration::from_secs(6));
+    let mut sys = System::new();
+    print_statistics(&mut sys, received_bytes_counter, &start);
 }
 
-fn print_statistics(sys: &mut System, received_bytes_counter: Arc<AtomicU64>) {
+fn print_statistics(sys: &mut System, received_bytes_counter: Arc<AtomicU64>, start: &Instant) {
     println!(
         "read: {}",
         format_size(received_bytes_counter.load(Ordering::SeqCst), humansize::DECIMAL)
     );
+    println!("bandwidth: {} MiB/s", received_bytes_counter.load(Ordering::SeqCst) as f64 / start.elapsed().as_secs_f64() / 1024.0 / 1024.0);
     unsafe {
         let mallinfo = libc::mallinfo();
         println!("arena: {}", format_size(mallinfo.arena as u32, humansize::DECIMAL)); /* non-mmapped space allocated from system */
-        println!("ordblks: {}", mallinfo.ordblks);
-        println!("smblks: {}", mallinfo.smblks);
-        println!("hblks: {}", mallinfo.hblks);
         println!("hblkhd: {}", format_size(mallinfo.hblkhd as u32, humansize::DECIMAL)); /* space in mmapped regions */
-        println!("fsmblks: {}", format_size(mallinfo.fsmblks as u32, humansize::DECIMAL));
-        println!(
-            "uordblks: {}",
-            format_size(mallinfo.uordblks as u32, humansize::DECIMAL)
-        );
         println!(
             "fordblks: {}",
             format_size(mallinfo.fordblks as u32, humansize::DECIMAL)
