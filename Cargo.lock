@@ -2621,7 +2621,6 @@ dependencies = [
  "crossbeam",
  "ctor",
  "futures",
- "lazy_static",
  "libc",
  "md-5",
  "metrics",
