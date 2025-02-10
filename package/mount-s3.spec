@@ -9,7 +9,6 @@ Source0:        mount-s3.tar.gz
 
 Requires:       ca-certificates
 Requires:       fuse
-Requires:       fuse-libs
 
 %description
 Mountpoint for Amazon S3 is a simple, high-throughput file client for
