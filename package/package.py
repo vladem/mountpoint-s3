@@ -49,7 +49,7 @@ class BuildMetadata:
 
 
 OPT_PATH = "opt/aws/mountpoint-s3"
-
+PRECOMPILED_PACKAGE_DIR = "/mountpoint-package"
 
 def check_dependencies(args: argparse.Namespace):
     """Check that all the required dependencies are available so we don't fail mid-build."""
@@ -75,7 +75,7 @@ def check_dependencies(args: argparse.Namespace):
         raise Exception(f"libfuse3 should not be installed (whereis output: {output})")
 
 
-def get_build_metadata(args: argparse.Namespace) -> BuildMetadata:
+def _get_build_metadata(args: argparse.Namespace) -> BuildMetadata:
     """Parse the Cargo metadata to find the version of the crate and its actual location."""
 
     log(f"Getting Cargo metadata from root dir {args.root_dir}")
@@ -124,7 +124,44 @@ def get_build_metadata(args: argparse.Namespace) -> BuildMetadata:
     return metadata
 
 
-def build_mountpoint_binary(metadata: BuildMetadata, args: argparse.Namespace) -> str:
+def get_build_metadata(args: argparse.Namespace) -> BuildMetadata:
+    """Parse the Cargo metadata to find the version of the crate and its actual location."""
+
+    log(f"Getting Cargo metadata from root dir {args.root_dir}")
+
+    root_dir = args.root_dir or os.getcwd()
+    version = args.expected_version
+    version_string = version
+    if not args.official:
+        version_string += "+unofficial"
+
+    # Use a temp directory for all our build's intermediate state
+    buildroot = tempfile.mkdtemp()
+
+    # Discover the architecture of this host
+    arch = run(["uname", "-p"]).decode("ascii").strip()
+    arch_name = arch
+    if arch == "aarch64":
+        # We want to use arm64 in the artifact names
+        arch_name = "arm64"
+
+    # Fully resolve output dir
+    output_dir = os.path.join(root_dir, "out")
+    os.makedirs(output_dir, exist_ok=True)
+
+    metadata = BuildMetadata(
+        output_dir=output_dir,
+        cargoroot=root_dir,
+        version=version,
+        version_string=version_string,
+        buildroot=buildroot,
+        arch=arch,
+        arch_name=arch_name,
+    )
+    return metadata
+
+
+def _build_mountpoint_binary(metadata: BuildMetadata, args: argparse.Namespace) -> str:
     """Compile the Mountpoint binary and make sure it has works/has the right version number.
     Return the path to the binary."""
 
@@ -166,8 +203,16 @@ def build_mountpoint_binary(metadata: BuildMetadata, args: argparse.Namespace) -
 
     return binary_path
 
+def build_mountpoint_binary(metadata: BuildMetadata, args: argparse.Namespace) -> str:
+    os.mkdir(PRECOMPILED_PACKAGE_DIR)
+    tar_gz_name = f"mount-s3-{metadata.version}-x86_64.tar.gz"
+    tar_gz_path = f"/tmp/{tar_gz_name}"
+    run(["wget", f"https://s3.amazonaws.com/mountpoint-s3-release/{metadata.version}/x86_64/{tar_gz_name}", "-O", tar_gz_path])
+    run(["tar", "-xzf", tar_gz_path, "-C", PRECOMPILED_PACKAGE_DIR])
+    return f"{PRECOMPILED_PACKAGE_DIR}/bin/mount-s3"
 
-def build_attribution(metadata: BuildMetadata) -> str:
+
+def _build_attribution(metadata: BuildMetadata) -> str:
     """Build the attribution document for third-party open-source code."""
 
     template_path = os.path.join(metadata.cargoroot, "package/attribution.hbs")
@@ -180,6 +225,11 @@ def build_attribution(metadata: BuildMetadata) -> str:
     run(cmd, cwd=metadata.cargoroot)
 
     return attribution_path
+
+
+def build_attribution(metadata: BuildMetadata) -> str:
+    """Build the attribution document for third-party open-source code."""
+    return f"{PRECOMPILED_PACKAGE_DIR}/THIRD_PARTY_LICENSES"
 
 
 def build_package_dir(metadata: BuildMetadata, binary_path: str, attribution_path: str) -> str:
@@ -246,7 +296,7 @@ def build_rpm(metadata: BuildMetadata, package_dir: str, distr: Optional[str] = 
     rpm_path = os.path.join(arch_dir, rpms[0])
     final_rpm_path = os.path.join(
         metadata.output_dir,
-        metadata.artifact_name("{}.rpm".format(distr) if distr else "rpm"),
+        metadata.artifact_name("{}.rpm".format(distr) if distr else "centos8.rpm"),
     )
     shutil.copy2(rpm_path, final_rpm_path)
 
@@ -328,9 +378,9 @@ def ensure_rustup_toolchain_is_installed(args: argparse.Namespace):
 def build(args: argparse.Namespace) -> str:
     """Top-level build driver."""
 
-    ensure_rustup_toolchain_is_installed(args)
+    # ensure_rustup_toolchain_is_installed(args)
 
-    check_dependencies(args)
+    # check_dependencies(args)
     metadata = get_build_metadata(args)
 
     binary_path = build_mountpoint_binary(metadata, args)
