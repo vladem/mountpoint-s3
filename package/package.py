@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Optional
+from typing import Optional, Tuple
 
 
 def log(msg: str):
@@ -32,7 +32,7 @@ def run(cmd, **kwargs):
 @dataclass
 class BuildMetadata:
     output_dir: str
-    cargoroot: str
+    cargoroot: str  # also a repo root
     version: str
     version_string: str
     buildroot: str
@@ -57,6 +57,8 @@ def check_dependencies(args: argparse.Namespace):
     log("Checking dependencies")
 
     deps = ["cargo", "cargo-about", "tar", "whereis"]
+    if args.from_archive:
+        deps = ["tar", "wget"]
     if not args.no_rpm:
         deps.extend(["rpm", "rpmbuild"])
     if not args.no_deb:
@@ -65,6 +67,9 @@ def check_dependencies(args: argparse.Namespace):
     for dep in deps:
         if shutil.which(dep) is None:
             raise Exception(f"`{dep}` must be installed")
+
+    if args.from_archive:
+        return
 
     output = run(["whereis", "libfuse"])
     if b"libfuse.so" not in output:
@@ -75,7 +80,7 @@ def check_dependencies(args: argparse.Namespace):
         raise Exception(f"libfuse3 should not be installed (whereis output: {output})")
 
 
-def _get_build_metadata(args: argparse.Namespace) -> BuildMetadata:
+def parse_cargo_metadata(args: argparse.Namespace) -> Tuple[str, str]:
     """Parse the Cargo metadata to find the version of the crate and its actual location."""
 
     log(f"Getting Cargo metadata from root dir {args.root_dir}")
@@ -94,43 +99,15 @@ def _get_build_metadata(args: argparse.Namespace) -> BuildMetadata:
     if args.expected_version is not None:
         if args.expected_version != version:
             raise Exception(f"version mismatch: expected {args.expected_version} but found {version} in Cargo metadata")
-    version_string = version
-    if not args.official:
-        version_string += "+unofficial"
 
-    # Use a temp directory for all our build's intermediate state
-    buildroot = tempfile.mkdtemp()
-
-    # Discover the architecture of this host
-    arch = run(["uname", "-p"]).decode("ascii").strip()
-    arch_name = arch
-    if arch == "aarch64":
-        # We want to use arm64 in the artifact names
-        arch_name = "arm64"
-
-    # Fully resolve output dir
-    output_dir = os.path.join(root_dir, "out")
-    os.makedirs(output_dir, exist_ok=True)
-
-    metadata = BuildMetadata(
-        output_dir=output_dir,
-        cargoroot=root_dir,
-        version=version,
-        version_string=version_string,
-        buildroot=buildroot,
-        arch=arch,
-        arch_name=arch_name,
-    )
-    return metadata
+    return (root_dir, version)
 
 
 def get_build_metadata(args: argparse.Namespace) -> BuildMetadata:
-    """Parse the Cargo metadata to find the version of the crate and its actual location."""
-
-    log(f"Getting Cargo metadata from root dir {args.root_dir}")
-
     root_dir = args.root_dir or os.getcwd()
     version = args.expected_version
+    if not args.from_archive:
+        root_dir, version = parse_cargo_metadata(args)
     version_string = version
     if not args.official:
         version_string += "+unofficial"
@@ -161,7 +138,7 @@ def get_build_metadata(args: argparse.Namespace) -> BuildMetadata:
     return metadata
 
 
-def _build_mountpoint_binary(metadata: BuildMetadata, args: argparse.Namespace) -> str:
+def build_mountpoint_binary(metadata: BuildMetadata, args: argparse.Namespace) -> str:
     """Compile the Mountpoint binary and make sure it has works/has the right version number.
     Return the path to the binary."""
 
@@ -203,16 +180,8 @@ def _build_mountpoint_binary(metadata: BuildMetadata, args: argparse.Namespace) 
 
     return binary_path
 
-def build_mountpoint_binary(metadata: BuildMetadata, args: argparse.Namespace) -> str:
-    os.mkdir(PRECOMPILED_PACKAGE_DIR)
-    tar_gz_name = f"mount-s3-{metadata.version}-x86_64.tar.gz"
-    tar_gz_path = f"/tmp/{tar_gz_name}"
-    run(["wget", f"https://s3.amazonaws.com/mountpoint-s3-release/{metadata.version}/x86_64/{tar_gz_name}", "-O", tar_gz_path])
-    run(["tar", "-xzf", tar_gz_path, "-C", PRECOMPILED_PACKAGE_DIR])
-    return f"{PRECOMPILED_PACKAGE_DIR}/bin/mount-s3"
 
-
-def _build_attribution(metadata: BuildMetadata) -> str:
+def build_attribution(metadata: BuildMetadata) -> str:
     """Build the attribution document for third-party open-source code."""
 
     template_path = os.path.join(metadata.cargoroot, "package/attribution.hbs")
@@ -227,8 +196,23 @@ def _build_attribution(metadata: BuildMetadata) -> str:
     return attribution_path
 
 
-def build_attribution(metadata: BuildMetadata) -> str:
-    """Build the attribution document for third-party open-source code."""
+def download_archive(metadata: BuildMetadata) -> str:
+    os.mkdir(PRECOMPILED_PACKAGE_DIR)
+    tar_gz_name = metadata.artifact_name("tar.gz")
+    tar_gz_path = f"/tmp/{tar_gz_name}"
+    run(["wget", f"https://s3.amazonaws.com/mountpoint-s3-release/{metadata.version}/{metadata.arch_name}/{tar_gz_name}", "-O", tar_gz_path])
+    run(["tar", "-xzf", tar_gz_path, "-C", PRECOMPILED_PACKAGE_DIR])
+    with open(f"{PRECOMPILED_PACKAGE_DIR}/VERSION", "r") as f:
+        archive_version = f.read()
+        if archive_version != metadata.version:
+            raise Exception(f"unexpected compiled version {archive_version}")
+
+
+def get_mountpoint_binary_path() -> str:
+    return f"{PRECOMPILED_PACKAGE_DIR}/bin/mount-s3"
+
+
+def get_attribution_path() -> str:
     return f"{PRECOMPILED_PACKAGE_DIR}/THIRD_PARTY_LICENSES"
 
 
@@ -378,13 +362,19 @@ def ensure_rustup_toolchain_is_installed(args: argparse.Namespace):
 def build(args: argparse.Namespace) -> str:
     """Top-level build driver."""
 
-    # ensure_rustup_toolchain_is_installed(args)
+    if not args.from_archive:
+        ensure_rustup_toolchain_is_installed(args)
 
-    # check_dependencies(args)
+    check_dependencies(args)
     metadata = get_build_metadata(args)
 
-    binary_path = build_mountpoint_binary(metadata, args)
-    attribution_path = build_attribution(metadata)
+    if args.from_archive:
+        download_archive(metadata)
+        binary_path = get_mountpoint_binary_path()
+        attribution_path = get_attribution_path()
+    else:
+        binary_path = build_mountpoint_binary(metadata, args)
+        attribution_path = build_attribution(metadata)
 
     package_dir = build_package_dir(metadata, binary_path, attribution_path)
 
@@ -395,7 +385,8 @@ def build(args: argparse.Namespace) -> str:
         artifacts.append(build_rpm(metadata, package_dir, "suse"))
     if not args.no_deb:
         artifacts.append(build_deb(metadata, package_dir))
-    artifacts.append(build_package_archive(metadata, package_dir))
+    if not args.no_archive:
+        artifacts.append(build_package_archive(metadata, package_dir))
 
     for path in artifacts:
         os.chmod(path, 0o755)
@@ -410,7 +401,9 @@ if __name__ == "__main__":
     p.add_argument("--no-rpm", action="store_true", help="do not build an RPM")
     p.add_argument("--no-suse-rpm", action="store_true", help="do not build an RPM for SUSE")
     p.add_argument("--no-deb", action="store_true", help="do not build a DEB")
+    p.add_argument("--no-archive", action="store_true", help="do not build a tar.gz")
     p.add_argument("--official", action="store_true", help="build as an official release")
+    p.add_argument("--from-archive", action="store_true", help="package pre-built executable from an archive package")
 
     args = p.parse_args()
 
