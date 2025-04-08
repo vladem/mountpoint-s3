@@ -21,16 +21,18 @@ pub enum ManifestEntry {
 }
 
 impl ManifestEntry {
-    fn file(db_entry: DbEntry) -> Self {
-        ManifestEntry::File {
-            full_key: db_entry.full_key,
-            etag: db_entry.etag,
-            size: db_entry.size,
-        }
-    }
-
-    fn directory(full_key: String) -> Self {
-        ManifestEntry::Directory { full_key }
+    fn from(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
+        let full_key: String = row.get(0)?;
+        let entry = if full_key.ends_with('/') {
+            Self::Directory { full_key }
+        } else {
+            Self::File {
+                full_key,
+                etag: row.get(1)?,
+                size: row.get(2)?,
+            }
+        };
+        Ok(entry)
     }
 }
 
@@ -62,10 +64,15 @@ impl Manifest {
         let mut full_path = parent_full_path;
         full_path.push_str(name);
 
+        let mut dir_key = String::with_capacity(full_path.len() + 1);
+        dir_key.push_str(&full_path);
+        dir_key.push('/');
+
         // search for an entry
         let start = Instant::now();
         let manifest_entry = self
-            .search_manifest_entry(&full_path)
+            .db
+            .select_entry(&full_path, &dir_key)
             .inspect_err(|err| error!("failed to query the database: {}", err))
             .map_err(|_| InodeError::InodeDoesNotExist(0))?; // TODO: ManifestError::DbError
         trace!("lookup db search completed in {:?}", start.elapsed());
@@ -81,54 +88,64 @@ impl Manifest {
     pub fn iter(&self, bucket: &str, directory_full_path: &str) -> Result<ManifestIter, InodeError> {
         ManifestIter::new(self.db.clone(), bucket, directory_full_path)
     }
-
-    /// Search an entry in the manifest that matches the path, a partial match is expected for a directory
-    fn search_manifest_entry(&self, full_path: &str) -> Result<Option<ManifestEntry>, rusqlite::Error> {
-        let dir_search_start = format!("{full_path}/");
-        let dir_search_end = format!("{full_path}0"); // any child of [full_path] directory will have a key which is "less" than this
-        let file_search = full_path;
-
-        let db_entry = self
-            .db
-            .select_entry_or_child(&dir_search_start, &dir_search_end, file_search)?;
-        let Some(db_entry) = db_entry else {
-            return Ok(None);
-        };
-
-        trace!(
-            "found entry in the manifest: {}, searched for: {}",
-            db_entry.full_key,
-            full_path
-        );
-
-        let entry = if db_entry.full_key == full_path {
-            // exact match means this is a file
-            ManifestEntry::file(db_entry)
-        } else if db_entry.full_key.starts_with(full_path) {
-            // partial match means this is a directory
-            ManifestEntry::directory(full_path.to_owned())
-        } else {
-            panic!("got non-matching row: {}, searched: {}", db_entry.full_key, full_path);
-        };
-
-        Ok(Some(entry))
-    }
 }
 
 #[derive(Debug)]
-struct DbEntry {
-    full_key: String,
-    etag: String,
-    size: usize,
+pub struct ManifestIter {
+    db: Db,
+    /// Prepared entries in order to be returned by the iterator.
+    entries: VecDeque<ManifestEntry>,
+    /// Key of the directory being listed by this iterator
+    parent_key: String,
+    /// Offset of the next child to search for in the database
+    next_offset: usize,
+    /// Max amount of entries to read from the database at once
+    batch_size: usize,
+    /// Database has no more entries
+    finished: bool,
 }
 
-impl DbEntry {
-    fn from(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
+impl ManifestIter {
+    fn new(db: Db, _bucket: &str, parent_key: &str) -> Result<Self, InodeError> {
+        let parent_key = parent_key.to_owned();
+        let batch_size = 10000;
         Ok(Self {
-            full_key: row.get(0)?,
-            etag: row.get(1)?,
-            size: row.get(2)?,
+            db,
+            entries: Default::default(),
+            parent_key,
+            next_offset: 0,
+            batch_size,
+            finished: false,
         })
+    }
+
+    /// Next child of the directory
+    pub fn next(&mut self) -> Result<Option<ManifestEntry>, InodeError> {
+        if self.entries.is_empty() && !self.finished {
+            self.search_next_entries()
+                .inspect_err(|err| error!("failed to query the database: {}", err))
+                .map_err(|_| InodeError::InodeDoesNotExist(0))?; // TODO: ManifestError::DbError
+        }
+
+        Ok(self.entries.pop_front())
+    }
+
+    /// Load next batch of entries from the database, keeping track of the `next_offset`
+    fn search_next_entries(&mut self) -> Result<(), rusqlite::Error> {
+        let start = Instant::now();
+        let db_entries = self
+            .db
+            .select_children(&self.parent_key, self.next_offset, self.batch_size)?;
+        trace!("list db search completed in {:?}", start.elapsed());
+
+        if db_entries.len() < self.batch_size {
+            self.finished = true;
+        }
+
+        self.next_offset += db_entries.len();
+        self.entries.extend(db_entries);
+
+        Ok(())
     }
 }
 
@@ -146,138 +163,30 @@ impl Db {
         })
     }
 
-    fn select_entry_or_child(
-        &self,
-        dir_search_start: &str,
-        dir_search_end: &str,
-        file_search: &str,
-    ) -> Result<Option<DbEntry>, rusqlite::Error> {
-        let query = "SELECT key, etag, size FROM s3_objects where (key > ?1 and key < ?2) or key = ?3 LIMIT 1";
+    /// Queries single row from the DB representing either the file or a directory
+    fn select_entry(&self, key: &str, dir_key: &str) -> Result<Option<ManifestEntry>, rusqlite::Error> {
+        let query = "SELECT key, etag, size FROM s3_objects WHERE key = ?1 OR key = ?2";
         let conn = self.conn.lock().expect("lock must succeed");
         let mut stmt = conn.prepare(query)?;
-        let manifest_entry = stmt
-            .query_map((dir_search_start, dir_search_end, file_search), |row| {
-                DbEntry::from(row)
-            })?
-            .next();
-
+        let mut rows = stmt.query_map((key, &dir_key), ManifestEntry::from)?;
+        let manifest_entry = rows.next();
+        debug_assert!(rows.next().is_none(), "query expected to return one row: {}", key); // TODO: return an error?
         manifest_entry.map_or(Ok(None), |v| v.map(Some))
     }
 
+    /// Queries up to `batch_size` direct children of the directory with key `parent`, starting from `next_offset`
     fn select_children(
         &self,
-        dir_search_start: &str,
-        dir_search_end: Option<&str>,
+        parent: &str,
+        next_offset: usize,
         batch_size: usize,
-    ) -> Result<Vec<DbEntry>, rusqlite::Error> {
+    ) -> Result<Vec<ManifestEntry>, rusqlite::Error> {
         let conn = self.conn.lock().expect("lock must succeed");
-        if let Some(dir_search_end) = dir_search_end {
-            let query = "SELECT key, etag, size FROM s3_objects where key > ?1 and key < ?2 ORDER BY key LIMIT ?3";
-            let query_params = (dir_search_start, dir_search_end, batch_size);
-            let mut stmt = conn.prepare(query)?;
-            let result: Result<Vec<_>, _> = stmt.query_map(query_params, DbEntry::from)?.collect();
-            result
-        } else {
-            let query = "SELECT key, etag, size FROM s3_objects where key > ?1 ORDER BY key LIMIT ?2";
-            let query_params = (dir_search_start, batch_size);
-            let mut stmt = conn.prepare(query)?;
-            let result: Result<Vec<_>, _> = stmt.query_map(query_params, DbEntry::from)?.collect();
-            result
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ManifestIter {
-    db: Db,
-    /// Prepared entries in order to be returned by the iterator.
-    entries: VecDeque<ManifestEntry>,
-    /// Key of the directory being listed by this iterator
-    parent_key: String,
-    /// Next key to search for in the database
-    search_from_key: String,
-    /// Name of the last subdirectory pushed to self.entries, used for deduplication
-    last_subdir_name: Option<String>,
-    /// Max amount of entries to read from the database at once
-    batch_size: usize,
-    /// Database has no more entries
-    finished: bool,
-}
-
-impl ManifestIter {
-    fn new(db: Db, _bucket: &str, parent_key: &str) -> Result<Self, InodeError> {
-        let parent_key = parent_key.to_owned();
-
-        let batch_size = 1000;
-        let search_from_key = parent_key.clone();
-        Ok(Self {
-            db,
-            entries: Default::default(),
-            parent_key,
-            search_from_key,
-            last_subdir_name: None,
-            batch_size,
-            finished: false,
-        })
-    }
-
-    /// Next child of the directory
-    pub fn next(&mut self) -> Result<Option<ManifestEntry>, InodeError> {
-        if self.entries.is_empty() {
-            self.search_next_entries()
-                .inspect_err(|err| error!("failed to query the database: {}", err))
-                .map_err(|_| InodeError::InodeDoesNotExist(0))?; // TODO: ManifestError::DbError
-        }
-
-        Ok(self.entries.pop_front())
-    }
-
-    /// Load next batch of entries from the database, inferring subdirectories and filtering out ancestors of those
-    fn search_next_entries(&mut self) -> Result<(), rusqlite::Error> {
-        let dir_search_end = if self.parent_key.is_empty() {
-            None
-        } else {
-            let mut dir_search_end = self.parent_key[..self.parent_key.len() - 1].to_owned();
-            dir_search_end.push('0'); // any child of [self.parent_key] directory will have a key which is "less" than this
-            Some(dir_search_end)
-        };
-
-        // Given that we filter loaded entries, we may need multiple requests to the db
-        while self.entries.is_empty() && !self.finished {
-            let start = Instant::now();
-            let db_entries =
-                self.db
-                    .select_children(&self.search_from_key, dir_search_end.as_deref(), self.batch_size)?;
-            trace!("list db search completed in {:?}", start.elapsed());
-
-            if db_entries.len() < self.batch_size {
-                self.finished = true;
-            }
-
-            if let Some(last_entry) = db_entries.last() {
-                self.search_from_key = last_entry.full_key.clone();
-            }
-
-            for db_entry in db_entries {
-                let relative_key = &db_entry.full_key[self.parent_key.len()..];
-                let components: Vec<&str> = relative_key.split('/').collect(); // todo: handle "//" and other weird names? empty?
-                let first_path_component = components[0];
-                let manifest_entry = if components.len() == 1 {
-                    // this file is a direct child of the listed directory
-                    ManifestEntry::file(db_entry)
-                } else if self.last_subdir_name.as_deref() != Some(first_path_component) {
-                    // infer a subdirectory, discarding the irrelevant part of the path
-                    self.last_subdir_name = Some(first_path_component.to_owned());
-                    let subdir_full_key = format!("{}{}/", self.parent_key, first_path_component);
-                    ManifestEntry::directory(subdir_full_key)
-                } else {
-                    // skipping subdirectory which was already pushed to self.entries
-                    continue;
-                };
-                self.entries.push_back(manifest_entry);
-            }
-        }
-
-        Ok(())
+        let query = "SELECT key, etag, size FROM s3_objects WHERE parent_key = ?1 ORDER BY key LIMIT ?2, ?3";
+        let mut stmt = conn.prepare(query)?;
+        let result: Result<Vec<_>, _> = stmt
+            .query_map((parent, next_offset, batch_size), ManifestEntry::from)?
+            .collect();
+        result
     }
 }
