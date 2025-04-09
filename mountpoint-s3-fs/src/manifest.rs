@@ -1,6 +1,6 @@
 use crate::sync::{Arc, Mutex};
-use std::collections::VecDeque;
 use std::time::Instant;
+use std::{collections::VecDeque, path::Path};
 
 use rusqlite::Connection;
 use tracing::{error, trace};
@@ -43,8 +43,8 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn new() -> Result<Self, rusqlite::Error> {
-        let db = Db::new()?;
+    pub fn new(manifest_db_path: &Path) -> Result<Self, rusqlite::Error> {
+        let db = Db::new(manifest_db_path)?;
         Ok(Self { db })
     }
 
@@ -69,13 +69,11 @@ impl Manifest {
         dir_key.push('/');
 
         // search for an entry
-        let start = Instant::now();
         let manifest_entry = self
             .db
             .select_entry(&full_path, &dir_key)
             .inspect_err(|err| error!("failed to query the database: {}", err))
             .map_err(|_| InodeError::InodeDoesNotExist(0))?; // TODO: ManifestError::DbError
-        trace!("lookup db search completed in {:?}", start.elapsed());
 
         // return an inode or error
         match manifest_entry {
@@ -132,11 +130,9 @@ impl ManifestIter {
 
     /// Load next batch of entries from the database, keeping track of the `next_offset`
     fn search_next_entries(&mut self) -> Result<(), rusqlite::Error> {
-        let start = Instant::now();
         let db_entries = self
             .db
             .select_children(&self.parent_key, self.next_offset, self.batch_size)?;
-        trace!("list db search completed in {:?}", start.elapsed());
 
         if db_entries.len() < self.batch_size {
             self.finished = true;
@@ -155,9 +151,8 @@ struct Db {
 }
 
 impl Db {
-    fn new() -> Result<Self, rusqlite::Error> {
-        let db_path = "./s3_objects.db3";
-        let conn = Connection::open(db_path)?;
+    fn new(manifest_db_path: &Path) -> Result<Self, rusqlite::Error> {
+        let conn = Connection::open(manifest_db_path)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)), // TODO: no mutex? serialized mode of sqlite?
         })
@@ -165,12 +160,18 @@ impl Db {
 
     /// Queries single row from the DB representing either the file or a directory
     fn select_entry(&self, key: &str, dir_key: &str) -> Result<Option<ManifestEntry>, rusqlite::Error> {
-        let query = "SELECT key, etag, size FROM s3_objects WHERE key = ?1 OR key = ?2";
+        let start = Instant::now();
         let conn = self.conn.lock().expect("lock must succeed");
+        metrics::histogram!("manifest.lookup.lock.elapsed_micros").record(start.elapsed().as_micros() as f64);
+
+        let start = Instant::now();
+        let query = "SELECT key, etag, size FROM s3_objects WHERE key = ?1 OR key = ?2";
         let mut stmt = conn.prepare(query)?;
         let mut rows = stmt.query_map((key, &dir_key), ManifestEntry::from)?;
         let manifest_entry = rows.next();
         debug_assert!(rows.next().is_none(), "query expected to return one row: {}", key); // TODO: return an error?
+        metrics::histogram!("manifest.lookup.query.elapsed_micros").record(start.elapsed().as_micros() as f64);
+
         manifest_entry.map_or(Ok(None), |v| v.map(Some))
     }
 
@@ -181,12 +182,18 @@ impl Db {
         next_offset: usize,
         batch_size: usize,
     ) -> Result<Vec<ManifestEntry>, rusqlite::Error> {
+        let start = Instant::now();
         let conn = self.conn.lock().expect("lock must succeed");
+        metrics::histogram!("manifest.readdir.lock.elapsed_micros").record(start.elapsed().as_micros() as f64);
+
+        let start = Instant::now();
         let query = "SELECT key, etag, size FROM s3_objects WHERE parent_key = ?1 ORDER BY key LIMIT ?2, ?3";
         let mut stmt = conn.prepare(query)?;
         let result: Result<Vec<_>, _> = stmt
             .query_map((parent, next_offset, batch_size), ManifestEntry::from)?
             .collect();
+        metrics::histogram!("manifest.readdir.query.elapsed_micros").record(start.elapsed().as_micros() as f64);
+
         result
     }
 }
