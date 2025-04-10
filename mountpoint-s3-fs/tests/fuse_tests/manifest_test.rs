@@ -1,4 +1,6 @@
 use crate::common::fuse::{self, read_dir_to_entry_names, TestClient, TestSessionConfig};
+#[cfg(feature = "s3_tests")]
+use crate::common::s3::{get_test_bucket_and_prefix, get_test_region, get_test_sdk_client};
 use mountpoint_s3_fs::manifest::builder::create_db_from_slice;
 use mountpoint_s3_fs::manifest::ManifestEntry;
 use mountpoint_s3_fs::S3FilesystemConfig;
@@ -6,6 +8,8 @@ use std::fs::{self, metadata};
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "s3_tests")]
+use std::{fs::File, io::Read};
 use tempfile::TempDir;
 use test_case::test_case;
 
@@ -95,9 +99,6 @@ fn test_lookup_unicode_keys_manifest() {
 #[test_case(false, true; "stat then read")]
 #[tokio::test]
 async fn test_basic_read_manifest_s3(readdir_before_read: bool, stat_before_read: bool) {
-    use crate::common::s3::{get_test_bucket_and_prefix, get_test_region, get_test_sdk_client};
-    use std::{fs::File, io::Read};
-
     let visible_object = ("visible_object_key", vec![b'1'; 1024]);
     let invisible_object = ("invisible_object_key", vec![b'2'; 1024]);
 
@@ -166,9 +167,38 @@ async fn test_basic_read_manifest_s3(readdir_before_read: bool, stat_before_read
     assert_eq!(e.kind(), ErrorKind::NotFound);
 }
 
+#[cfg(feature = "s3_tests")]
+#[test_case(false, true, libc::EIO; "wrong size")]
+#[test_case(true, false, libc::ESTALE; "wrong etag")]
+#[tokio::test]
+async fn test_read_manifest_wrong_metadata(wrong_etag: bool, wrong_size: bool, errno: i32) {
+    let object = ("visible_object_key", vec![b'1'; 1024]);
+    let (bucket, prefix) = get_test_bucket_and_prefix("test_basic_read_manifest_s3");
+    let sdk_client = get_test_sdk_client(&get_test_region()).await;
+    let object_props = put_object(&sdk_client, &bucket, &prefix, object.0, object.1.clone()).await;
+
+    let (_tmp_dir, db_path) = create_manifest(&[ManifestEntry::File {
+        full_key: format!("{}{}", prefix, object.0),
+        etag: if wrong_etag {
+            "wrong_etag".to_string()
+        } else {
+            object_props.0
+        },
+        size: if wrong_size { 2048 } else { object_props.1 }, // size smaller than actual will result in incomplete response
+    }]);
+    let test_session =
+        fuse::s3_session::new_with_test_client(manifest_test_session_config(&db_path), sdk_client, &bucket, &prefix);
+
+    let mut fh = File::options()
+        .read(true)
+        .open(test_session.mount_path().join(object.0))
+        .unwrap();
+    let mut read_buffer = Default::default();
+    let e = fh.read_to_end(&mut read_buffer).expect_err("read must fail");
+    assert_eq!(e.raw_os_error().expect("read must fail"), errno);
+}
+
 // fn test_manifest_forbidden_operations() // including wrong open flags
-// fn test_read_manifest_wrong_etag()
-// fn test_read_manifest_wrong_size()
 // fn test_read_manifest_missing_etag()
 // fn test_read_manifest_missing_size()
 
