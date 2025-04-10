@@ -7,6 +7,8 @@ use tracing::{error, trace};
 
 use crate::superblock::{Inode, InodeError, InodeKind};
 
+use base64ct::{Base64, Encoding};
+
 /// An entry returned by manifest_lookup() and ManifestIter::next()
 #[derive(Debug, Clone)]
 pub enum ManifestEntry {
@@ -33,6 +35,37 @@ impl ManifestEntry {
             }
         };
         Ok(entry)
+    }
+
+    fn from_csv(csv_row: &str) -> Self {
+        let tokens: Vec<&str> = csv_row.trim().split(",").collect();
+        let decoded_key = Base64::decode_vec(tokens[0]).expect("must be a valid base64");
+        let decoded_key = String::from_utf8(decoded_key).expect("must be a valid utf-8");
+        assert!(!decoded_key.is_empty()); // TODO: return an error
+
+        Self::File {
+            full_key: decoded_key,
+            etag: tokens[1].to_owned(),
+            size: tokens[2].parse::<usize>().expect("must be a number"), // TODO: return an error
+        }
+    }
+
+    fn key(&self) -> &str {
+        match self {
+            ManifestEntry::File { full_key, .. } => full_key,
+            ManifestEntry::Directory { full_key } => full_key,
+        }
+    }
+
+    fn parent_key(&self) -> &str {
+        let key = self.key().trim_end_matches("/");
+        let last_component_len = key.rsplit("/").next().expect("expect at least one component").len();
+        if last_component_len == key.len() {
+            // root parent is special, it doesn't contain '/'
+            ""
+        } else {
+            &key[..key.len() - last_component_len]
+        }
     }
 }
 
@@ -118,7 +151,7 @@ impl ManifestIter {
     }
 
     /// Next child of the directory
-    pub fn next(&mut self) -> Result<Option<ManifestEntry>, InodeError> {
+    pub fn next_entry(&mut self) -> Result<Option<ManifestEntry>, InodeError> {
         if self.entries.is_empty() && !self.finished {
             self.search_next_entries()
                 .inspect_err(|err| error!("failed to query the database: {}", err))
@@ -195,5 +228,203 @@ impl Db {
         metrics::histogram!("manifest.readdir.query.elapsed_micros").record(start.elapsed().as_micros() as f64);
 
         result
+    }
+}
+
+pub mod builder {
+    use super::ManifestEntry;
+    use rusqlite::Connection;
+    use std::{
+        fs::File,
+        io::{BufRead, BufReader},
+        path::Path,
+    };
+
+    // Creates a db from ManifestEntry representing keys of S3 objects. Infers parent directories.
+    // Used in tests, not optimized for large datasets.
+    pub fn create_db_from_slice(db_path: &Path, entries: &[ManifestEntry]) -> Result<(), rusqlite::Error> {
+        let db = DbWriter::new(db_path)?;
+        db.create_table_with_id()?;
+        db.insert_batch(entries)?;
+        db.insert_directories()?;
+        db.create_index()?;
+        Ok(())
+    }
+
+    // TODO: directory shadowing ("a/b" key not available if "a/b/c.txt" exists)
+    // TODO: s3 keys ending with '/'?
+    pub fn create_db_from_csv(db_path: &Path, csv_path: &Path, batch_size: usize) -> Result<(), rusqlite::Error> {
+        let db = DbWriter::new(db_path)?;
+        db.create_table_with_id()?;
+
+        let file = File::open(csv_path).expect("input file must exist");
+        let reader = BufReader::new(file);
+        let mut buffer = Vec::<ManifestEntry>::with_capacity(batch_size);
+        for line in reader.lines() {
+            let entry = ManifestEntry::from_csv(&line.expect("must be a line"));
+            buffer.push(entry);
+
+            if buffer.len() >= batch_size {
+                db.insert_batch(&buffer)?;
+                buffer.clear();
+            }
+        }
+
+        db.insert_directories()?;
+        db.create_index()?;
+        Ok(())
+    }
+
+    struct DbWriter {
+        conn: Connection,
+    }
+
+    impl DbWriter {
+        fn new(manifest_db_path: &Path) -> Result<Self, rusqlite::Error> {
+            let conn = Connection::open(manifest_db_path)?;
+            let mode: String = conn.query_row("PRAGMA journal_mode=off", [], |row| row.get(0))?;
+            assert_eq!(&mode, "off");
+
+            Ok(Self { conn })
+        }
+
+        fn create_table_with_id(&self) -> Result<(), rusqlite::Error> {
+            self.conn.execute(
+                "CREATE TABLE s3_objects (
+                    id          INTEGER   PRIMARY KEY,
+                    key         TEXT      NOT NULL,
+                    parent_key  TEXT      NOT NULL,
+                    etag        TEXT      NULL,
+                    size        INTEGER   NULL
+                )",
+                (),
+            )?;
+
+            Ok(())
+        }
+
+        fn create_index(&self) -> Result<(), rusqlite::Error> {
+            self.conn
+                .execute("CREATE UNIQUE INDEX idx_key ON s3_objects (key)", ())?;
+
+            self.conn
+                .execute("CREATE INDEX idx_parent_key ON s3_objects (parent_key, key)", ())?;
+
+            Ok(())
+        }
+
+        fn insert_batch(&self, entries: &[ManifestEntry]) -> Result<(), rusqlite::Error> {
+            println!("inserting entries: {:?}", entries);
+            self.conn.execute_batch("BEGIN TRANSACTION;")?;
+            let mut object_key_stmt = self
+                .conn
+                .prepare("INSERT INTO s3_objects (key, parent_key, etag, size) VALUES (?1, ?2, ?3, ?4)")?;
+            let mut directory_key_stmt = self
+                .conn
+                .prepare("INSERT INTO s3_objects (key, parent_key) VALUES (?1, ?2)")?;
+            for entry in entries {
+                match entry {
+                    ManifestEntry::File { full_key, etag, size } => {
+                        object_key_stmt.execute((full_key, entry.parent_key(), etag, size))?;
+                    }
+                    ManifestEntry::Directory { full_key } => {
+                        directory_key_stmt.execute((full_key, entry.parent_key()))?;
+                    }
+                }
+            }
+            self.conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+
+        // TODO: insert directories in batches
+        fn insert_directories(&self) -> Result<usize, rusqlite::Error> {
+            let query = "SELECT key FROM s3_objects ORDER BY key";
+            let mut stmt = self.conn.prepare(query)?;
+            let keys_iter = stmt.query_map((), |row| {
+                let key: String = row.get(0)?;
+                Ok(key)
+            })?;
+
+            let mut prev_s3_key: Option<String> = None;
+            let mut insert_buffer: Vec<ManifestEntry> = Default::default();
+            for s3_key in keys_iter {
+                let s3_key = s3_key.expect("db field must be a valid string");
+                let prev_components: Vec<&str> = if let Some(prev_s3_key) = &prev_s3_key {
+                    prev_s3_key.split("/").collect()
+                } else {
+                    Default::default()
+                };
+                let components: Vec<&str> = s3_key.split("/").collect();
+
+                // find the first subdirectory which wasn't created yet
+                let mut longest_common_path_len = 0;
+                let mut common_components_count = 0;
+                for (idx, component) in components.iter().take(components.len() - 1).enumerate() {
+                    if idx >= prev_components.len() || *component != prev_components[idx] {
+                        break;
+                    }
+                    longest_common_path_len += component.len() + 1;
+                    common_components_count += 1;
+                }
+
+                // create new subdirectories
+                let mut dir_key_len = longest_common_path_len;
+                for component in components
+                    .iter()
+                    .take(components.len() - 1)
+                    .skip(common_components_count)
+                {
+                    dir_key_len += component.len() + 1; // includes the trailing '/'
+                    insert_buffer.push(ManifestEntry::Directory {
+                        full_key: s3_key[..dir_key_len].to_owned(),
+                    });
+                }
+
+                prev_s3_key = Some(s3_key);
+            }
+
+            self.insert_batch(&insert_buffer)?;
+
+            Ok(insert_buffer.len())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest_entry_parent_key() {
+        let entry = ManifestEntry::File {
+            full_key: "a.txt".to_string(),
+            etag: "".to_string(),
+            size: 0,
+        };
+        assert_eq!(entry.parent_key(), "");
+
+        let entry = ManifestEntry::File {
+            full_key: "dir1/a.txt".to_string(),
+            etag: "".to_string(),
+            size: 0,
+        };
+        assert_eq!(entry.parent_key(), "dir1/");
+
+        let entry = ManifestEntry::File {
+            full_key: "dir1/dir2/a.txt".to_string(),
+            etag: "".to_string(),
+            size: 0,
+        };
+        assert_eq!(entry.parent_key(), "dir1/dir2/");
+
+        let entry = ManifestEntry::Directory {
+            full_key: "dir1/".to_string(),
+        };
+        assert_eq!(entry.parent_key(), "");
+
+        let entry = ManifestEntry::Directory {
+            full_key: "dir1/dir2/".to_string(),
+        };
+        assert_eq!(entry.parent_key(), "dir1/");
     }
 }

@@ -648,7 +648,7 @@ mod manifest {
         /// Return the next [ReaddirEntry] for the directory stream. If the stream is finished, returns
         /// `Ok(None)`.
         pub(super) fn next(&mut self) -> Result<Option<ReaddirEntry>, InodeError> {
-            let readdir_entry = match self.manifest_iter.next()? {
+            let readdir_entry = match self.manifest_iter.next_entry()? {
                 Some(ManifestEntry::File { full_key, etag, size }) => {
                     let name = full_key[self.full_path_len..].to_owned();
                     Some(ReaddirEntry::RemoteObject {
