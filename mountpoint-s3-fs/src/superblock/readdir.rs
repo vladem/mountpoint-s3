@@ -98,10 +98,10 @@ impl ReaddirHandle {
             }
         };
 
-        let iter = if inner.config.manifest_db_path.is_some() {
+        let iter = if let Some(manifest) = inner.manifest.as_ref() {
             trace!("using manifest readdir iter");
             ReaddirIter::manifest(
-                inner.manifest.as_ref().expect("manifest should be set"),
+                manifest,
                 &inner.bucket,
                 &full_path,
             )?

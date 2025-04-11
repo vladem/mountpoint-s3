@@ -228,7 +228,6 @@ async fn test_read_manifest_wrong_metadata(wrong_etag: bool, wrong_size: bool, e
 }
 
 // fn test_manifest_forbidden_operations() // including wrong open flags
-// fn test_read_manifest_missing_size()
 // fn test_fs_creation_no_manifest() // empty_manifest, wrong format
 
 fn manifest_test_session_config(db_path: &Path) -> TestSessionConfig {
