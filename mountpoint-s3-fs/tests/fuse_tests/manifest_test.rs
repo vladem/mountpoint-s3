@@ -1,7 +1,7 @@
 use crate::common::fuse::{self, read_dir_to_entry_names, TestClient, TestSessionConfig};
 #[cfg(feature = "s3_tests")]
 use crate::common::s3::{get_test_bucket_and_prefix, get_test_region, get_test_sdk_client};
-use mountpoint_s3_fs::manifest::builder::create_db_from_slice;
+use mountpoint_s3_fs::manifest::builder::{create_db_from_slice, insert_row};
 use mountpoint_s3_fs::manifest::ManifestEntry;
 use mountpoint_s3_fs::S3FilesystemConfig;
 use std::fs::{self, metadata};
@@ -68,6 +68,23 @@ fn test_readdir_manifest_20k_keys() {
     assert_eq!(dir_entry_names, expected_children, "readdir test failed");
 }
 
+#[test_case(Some("dummy_etag"), None; "missing size")]
+#[test_case(None, Some(1); "missing etag")]
+fn test_readdir_manifest_missing_metadata(etag: Option<&str>, size: Option<usize>) {
+    let key = "key";
+    let (_tmp_dir, db_path) = create_dummy_manifest::<&str>(&[], 0);
+    let test_session = fuse::mock_session::new("", manifest_test_session_config(&db_path));
+    insert_row(&db_path, (key, "", etag, size)).expect("insert invalid row must succeed");
+
+    let mut read_dir_iter = fs::read_dir(test_session.mount_path()).unwrap();
+    let e = read_dir_iter
+        .next()
+        .expect("iterator not empty")
+        .expect_err("first item is an error");
+    assert_eq!(e.raw_os_error().expect("must be an error"), libc::EIO);
+    assert!(read_dir_iter.next().is_none(), "no more items in the iterator");
+}
+
 #[test]
 fn test_lookup_unicode_keys_manifest() {
     // todo: are non UTF-8 keys supported?
@@ -91,6 +108,18 @@ fn test_lookup_unicode_keys_manifest() {
     assert_eq!(e.kind(), ErrorKind::InvalidInput); // fs API does not allow using \0 in file names
     let e = metadata(test_session.mount_path().join("こんにちは")).expect_err("must not exist");
     assert_eq!(e.kind(), ErrorKind::NotFound);
+}
+
+#[test_case(Some("dummy_etag"), None; "missing size")]
+#[test_case(None, Some(1); "missing etag")]
+fn test_lookup_manifest_missing_metadata(etag: Option<&str>, size: Option<usize>) {
+    let key = "key";
+    let (_tmp_dir, db_path) = create_dummy_manifest::<&str>(&[], 0);
+    let test_session = fuse::mock_session::new("", manifest_test_session_config(&db_path));
+    insert_row(&db_path, (key, "", etag, size)).expect("insert invalid row must succeed");
+
+    let e = metadata(test_session.mount_path().join(key)).expect_err("lookup must fail");
+    assert_eq!(e.raw_os_error().expect("lookup must fail"), libc::EIO);
 }
 
 #[cfg(feature = "s3_tests")]
@@ -199,8 +228,8 @@ async fn test_read_manifest_wrong_metadata(wrong_etag: bool, wrong_size: bool, e
 }
 
 // fn test_manifest_forbidden_operations() // including wrong open flags
-// fn test_read_manifest_missing_etag()
 // fn test_read_manifest_missing_size()
+// fn test_fs_creation_no_manifest() // empty_manifest, wrong format
 
 fn manifest_test_session_config(db_path: &Path) -> TestSessionConfig {
     TestSessionConfig {

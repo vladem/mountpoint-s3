@@ -620,11 +620,15 @@ mod manifest {
                     let object_info = ObjectInfo {
                         key: full_key.clone(),
                         size: size as u64,
-                        last_modified: OffsetDateTime::now_utc(),
+                        last_modified: OffsetDateTime::now_utc(), // TODO: mount time
+                        // Intentionally leaving `storage_class` and `restore_status` empty,
+                        // which may result in EIO errors on read for GLACIER | DEEP_ARCHIVE objects
                         storage_class: None,
                         restore_status: None,
                         etag: etag.clone(),
-                        checksum_algorithms: Default::default(), // TODO: what are the implications?
+                        // TODO, `checksum_algorithms` is currently ignored, but leaving the vector empty may be misleading in future:
+                        // https://github.com/awslabs/mountpoint-s3/blob/e85566e5bd85e295f490b5f80ae05f5d0fe966e3/mountpoint-s3-fs/src/superblock/readdir.rs#L177-L184
+                        checksum_algorithms: Default::default(),
                     };
                     Some(ReaddirEntry::RemoteObject { name, object_info })
                 }

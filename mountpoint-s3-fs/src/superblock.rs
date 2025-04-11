@@ -40,7 +40,7 @@ use tracing::{debug, error, trace, warn};
 use crate::fs::error_metadata::{ErrorMetadata, MOUNTPOINT_ERROR_CLIENT};
 use crate::fs::CacheConfig;
 use crate::logging;
-use crate::manifest::{Manifest, ManifestEntry};
+use crate::manifest::{Manifest, ManifestEntry, ManifestError};
 use crate::prefix::Prefix;
 use crate::s3::S3Personality;
 use crate::sync::atomic::{AtomicU64, Ordering};
@@ -672,15 +672,25 @@ impl SuperblockInner {
         name: &str,
     ) -> Result<Option<RemoteLookup>, InodeError> {
         let parent = self.get(parent_ino)?;
+        if parent.kind() != InodeKind::Directory {
+            return Err(InodeError::NotADirectory(parent.err()));
+        }
+
         let parent_full_path = self.full_key_for_inode(&parent);
         let mount_time = OffsetDateTime::now_utc(); // todo: mount time
-        let remote_lookup = match manifest.manifest_lookup(parent, parent_full_path, name)? {
+        let Some(manifest_entry) = manifest.manifest_lookup(parent_full_path, name)? else {
+            return Ok(None);
+        };
+
+        let remote_lookup = match manifest_entry {
             ManifestEntry::File { etag, size, .. } => RemoteLookup {
                 kind: InodeKind::File,
                 stat: InodeStat::for_file(
                     size,
                     mount_time,
                     Some(etag.as_str().into()),
+                    // Intentionally leaving `storage_class` and `restore_status` empty,
+                    // which may result in EIO errors on read for GLACIER | DEEP_ARCHIVE objects
                     None,
                     None,
                     self.config.cache_config.file_ttl,
@@ -1154,6 +1164,8 @@ pub enum InodeError {
         old_inode: InodeErrorInfo,
         new_inode: InodeErrorInfo,
     },
+    #[error("manifest error")]
+    ManifestError(#[from] ManifestError),
 }
 
 impl InodeError {
