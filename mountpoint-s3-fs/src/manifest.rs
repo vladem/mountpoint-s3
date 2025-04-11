@@ -3,11 +3,22 @@ use std::time::Instant;
 use std::{collections::VecDeque, path::Path};
 
 use rusqlite::Connection;
+use thiserror::Error;
 use tracing::{error, trace};
 
-use crate::superblock::{Inode, InodeError, InodeKind};
+use crate::superblock::InodeError;
 
 use base64ct::{Base64, Encoding};
+
+#[derive(Debug, Error)]
+pub enum ManifestError {
+    #[error("database error")]
+    DbError(#[from] rusqlite::Error),
+    #[error("file shadowed by a directory must not exist in db")]
+    UnexpectedShadowedFile(String),
+    #[error("invalid csv")]
+    InvalidCsv,
+}
 
 /// An entry returned by manifest_lookup() and ManifestIter::next()
 #[derive(Debug, Clone)]
@@ -23,7 +34,7 @@ pub enum ManifestEntry {
 }
 
 impl ManifestEntry {
-    fn from(row: &rusqlite::Row) -> Result<Self, rusqlite::Error> {
+    fn from(row: &rusqlite::Row) -> Result<Self, ManifestError> {
         let full_key: String = row.get(0)?;
         let entry = if full_key.ends_with('/') {
             Self::Directory { full_key }
@@ -37,16 +48,18 @@ impl ManifestEntry {
         Ok(entry)
     }
 
-    fn from_csv(csv_row: &str) -> Self {
+    fn from_csv(csv_row: &str) -> Result<Self, ManifestError> {
         let tokens: Vec<&str> = csv_row.trim().split(",").collect();
-        let decoded_key = Base64::decode_vec(tokens[0]).expect("must be a valid base64");
-        let decoded_key = String::from_utf8(decoded_key).expect("must be a valid utf-8");
-        assert!(!decoded_key.is_empty()); // TODO: return an error
-
-        Self::File {
-            full_key: decoded_key,
-            etag: tokens[1].to_owned(),
-            size: tokens[2].parse::<usize>().expect("must be a number"), // TODO: return an error
+        let decoded_key = Base64::decode_vec(tokens[0]).map_err(|_| ManifestError::InvalidCsv)?;
+        let decoded_key = String::from_utf8(decoded_key).map_err(|_| ManifestError::InvalidCsv)?;
+        if decoded_key.is_empty() {
+            Err(ManifestError::InvalidCsv)
+        } else {
+            Ok(Self::File {
+                full_key: decoded_key,
+                etag: tokens[1].to_owned(),
+                size: tokens[2].parse::<usize>().map_err(|_| ManifestError::InvalidCsv)?,
+            })
         }
     }
 
@@ -84,16 +97,10 @@ impl Manifest {
     /// Lookup an entry in the manifest, the result may be a file or a directory
     pub fn manifest_lookup(
         &self,
-        parent: Inode,
         parent_full_path: String,
         name: &str,
-    ) -> Result<ManifestEntry, InodeError> {
+    ) -> Result<Option<ManifestEntry>, ManifestError> {
         trace!("using manifest to lookup {} in {}", name, parent_full_path);
-
-        if parent.kind() != InodeKind::Directory {
-            return Err(InodeError::NotADirectory(parent.err()));
-        }
-
         let mut full_path = parent_full_path;
         full_path.push_str(name);
 
@@ -102,17 +109,7 @@ impl Manifest {
         dir_key.push('/');
 
         // search for an entry
-        let manifest_entry = self
-            .db
-            .select_entry(&full_path, &dir_key)
-            .inspect_err(|err| error!("failed to query the database: {}", err))
-            .map_err(|_| InodeError::InodeDoesNotExist(0))?; // TODO: ManifestError::DbError
-
-        // return an inode or error
-        match manifest_entry {
-            Some(manifest_entry) => Ok(manifest_entry.clone()),
-            None => Err(InodeError::FileDoesNotExist(name.to_owned(), parent.err())),
-        }
+        self.db.select_entry(&full_path, &dir_key)
     }
 
     /// Create an iterator over directory's direct children
@@ -151,18 +148,16 @@ impl ManifestIter {
     }
 
     /// Next child of the directory
-    pub fn next_entry(&mut self) -> Result<Option<ManifestEntry>, InodeError> {
+    pub fn next_entry(&mut self) -> Result<Option<ManifestEntry>, ManifestError> {
         if self.entries.is_empty() && !self.finished {
-            self.search_next_entries()
-                .inspect_err(|err| error!("failed to query the database: {}", err))
-                .map_err(|_| InodeError::InodeDoesNotExist(0))?; // TODO: ManifestError::DbError
+            self.search_next_entries()?
         }
 
         Ok(self.entries.pop_front())
     }
 
     /// Load next batch of entries from the database, keeping track of the `next_offset`
-    fn search_next_entries(&mut self) -> Result<(), rusqlite::Error> {
+    fn search_next_entries(&mut self) -> Result<(), ManifestError> {
         let db_entries = self
             .db
             .select_children(&self.parent_key, self.next_offset, self.batch_size)?;
@@ -192,7 +187,7 @@ impl Db {
     }
 
     /// Queries single row from the DB representing either the file or a directory
-    fn select_entry(&self, key: &str, dir_key: &str) -> Result<Option<ManifestEntry>, rusqlite::Error> {
+    fn select_entry(&self, key: &str, dir_key: &str) -> Result<Option<ManifestEntry>, ManifestError> {
         let start = Instant::now();
         let conn = self.conn.lock().expect("lock must succeed");
         metrics::histogram!("manifest.lookup.lock.elapsed_micros").record(start.elapsed().as_micros() as f64);
@@ -200,12 +195,20 @@ impl Db {
         let start = Instant::now();
         let query = "SELECT key, etag, size FROM s3_objects WHERE key = ?1 OR key = ?2";
         let mut stmt = conn.prepare(query)?;
-        let mut rows = stmt.query_map((key, &dir_key), ManifestEntry::from)?;
-        let manifest_entry = rows.next();
-        debug_assert!(rows.next().is_none(), "query expected to return one row: {}", key); // TODO: return an error?
+        let mut rows = stmt.query((key, &dir_key))?;
+        let row = rows.next()?;
+        let manifest_entry = match row {
+            Some(row) => Some(ManifestEntry::from(row)?),
+            None => None,
+        };
+        if rows.next()?.is_some() {
+            // there is a UNIQUE index on key, so we found a file and directory with this query,
+            // the file is expected to be filtered out on ingestion of csv to db
+            return Err(ManifestError::UnexpectedShadowedFile(key.to_string()));
+        }
         metrics::histogram!("manifest.lookup.query.elapsed_micros").record(start.elapsed().as_micros() as f64);
 
-        manifest_entry.map_or(Ok(None), |v| v.map(Some))
+        Ok(manifest_entry)
     }
 
     /// Queries up to `batch_size` direct children of the directory with key `parent`, starting from `next_offset`
@@ -214,7 +217,7 @@ impl Db {
         parent: &str,
         next_offset: usize,
         batch_size: usize,
-    ) -> Result<Vec<ManifestEntry>, rusqlite::Error> {
+    ) -> Result<Vec<ManifestEntry>, ManifestError> {
         let start = Instant::now();
         let conn = self.conn.lock().expect("lock must succeed");
         metrics::histogram!("manifest.readdir.lock.elapsed_micros").record(start.elapsed().as_micros() as f64);
@@ -222,17 +225,19 @@ impl Db {
         let start = Instant::now();
         let query = "SELECT key, etag, size FROM s3_objects WHERE parent_key = ?1 ORDER BY key LIMIT ?2, ?3";
         let mut stmt = conn.prepare(query)?;
-        let result: Result<Vec<_>, _> = stmt
-            .query_map((parent, next_offset, batch_size), ManifestEntry::from)?
-            .collect();
+        let mut result = Vec::with_capacity(batch_size);
+        let mut rows = stmt.query((parent, next_offset, batch_size))?;
+        while let Some(row) = rows.next()? {
+            result.push(ManifestEntry::from(row)?)
+        }
         metrics::histogram!("manifest.readdir.query.elapsed_micros").record(start.elapsed().as_micros() as f64);
 
-        result
+        Ok(result)
     }
 }
 
 pub mod builder {
-    use super::ManifestEntry;
+    use super::{ManifestEntry, ManifestError};
     use rusqlite::Connection;
     use std::{
         fs::File,
@@ -242,6 +247,7 @@ pub mod builder {
 
     // Creates a db from ManifestEntry representing keys of S3 objects. Infers parent directories.
     // Used in tests, not optimized for large datasets.
+    #[cfg(feature = "manifest_tests")]
     pub fn create_db_from_slice(db_path: &Path, entries: &[ManifestEntry]) -> Result<(), rusqlite::Error> {
         let db = DbWriter::new(db_path)?;
         db.create_table_with_id()?;
@@ -251,9 +257,15 @@ pub mod builder {
         Ok(())
     }
 
+    #[cfg(feature = "manifest_tests")]
+    pub fn insert_row(db_path: &Path, row: (&str, &str, Option<&str>, Option<usize>)) -> Result<(), rusqlite::Error> {
+        let db = DbWriter::new(db_path)?;
+        db.insert_row(row)
+    }
+
     // TODO: directory shadowing ("a/b" key not available if "a/b/c.txt" exists)
     // TODO: s3 keys ending with '/'?
-    pub fn create_db_from_csv(db_path: &Path, csv_path: &Path, batch_size: usize) -> Result<(), rusqlite::Error> {
+    pub fn create_db_from_csv(db_path: &Path, csv_path: &Path, batch_size: usize) -> Result<(), ManifestError> {
         let db = DbWriter::new(db_path)?;
         db.create_table_with_id()?;
 
@@ -261,7 +273,7 @@ pub mod builder {
         let reader = BufReader::new(file);
         let mut buffer = Vec::<ManifestEntry>::with_capacity(batch_size);
         for line in reader.lines() {
-            let entry = ManifestEntry::from_csv(&line.expect("must be a line"));
+            let entry = ManifestEntry::from_csv(&line.map_err(|_| ManifestError::InvalidCsv)?)?;
             buffer.push(entry);
 
             if buffer.len() >= batch_size {
@@ -314,7 +326,6 @@ pub mod builder {
         }
 
         fn insert_batch(&self, entries: &[ManifestEntry]) -> Result<(), rusqlite::Error> {
-            println!("inserting entries: {:?}", entries);
             self.conn.execute_batch("BEGIN TRANSACTION;")?;
             let mut object_key_stmt = self
                 .conn
@@ -348,7 +359,7 @@ pub mod builder {
             let mut prev_s3_key: Option<String> = None;
             let mut insert_buffer: Vec<ManifestEntry> = Default::default();
             for s3_key in keys_iter {
-                let s3_key = s3_key.expect("db field must be a valid string");
+                let s3_key = s3_key?;
                 let prev_components: Vec<&str> = if let Some(prev_s3_key) = &prev_s3_key {
                     prev_s3_key.split("/").collect()
                 } else {
@@ -375,8 +386,10 @@ pub mod builder {
                     .skip(common_components_count)
                 {
                     dir_key_len += component.len() + 1; // includes the trailing '/'
+                    let directory_key = &s3_key[..dir_key_len];
+                    debug_assert!(directory_key.ends_with("/"));
                     insert_buffer.push(ManifestEntry::Directory {
-                        full_key: s3_key[..dir_key_len].to_owned(),
+                        full_key: directory_key.to_owned(),
                     });
                 }
 
@@ -386,6 +399,15 @@ pub mod builder {
             self.insert_batch(&insert_buffer)?;
 
             Ok(insert_buffer.len())
+        }
+
+        #[cfg(feature = "manifest_tests")]
+        fn insert_row(&self, row: (&str, &str, Option<&str>, Option<usize>)) -> Result<(), rusqlite::Error> {
+            let mut object_key_stmt = self
+                .conn
+                .prepare("INSERT INTO s3_objects (key, parent_key, etag, size) VALUES (?1, ?2, ?3, ?4)")?;
+            object_key_stmt.execute(row)?;
+            Ok(())
         }
     }
 }

@@ -1,5 +1,5 @@
 use clap::Parser;
-use mountpoint_s3_fs::manifest::builder::create_db_from_csv;
+use mountpoint_s3_fs::manifest::{builder::create_db_from_csv, ManifestError};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -18,7 +18,7 @@ struct CliArgs {
     db_path: PathBuf,
 }
 
-fn main() -> Result<(), rusqlite::Error> {
+fn main() -> Result<(), ManifestError> {
     let args = CliArgs::parse();
 
     let batch_size = 100000usize;
