@@ -395,6 +395,15 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
         value_name = "NETWORK_INTERFACE",
     )]
     pub bind: Option<Vec<String>>,
+
+    #[clap(
+        short,
+        long,
+        help = "Sqlite .db3 file with metadata for S3 objects",
+        help_heading = MOUNT_OPTIONS_HEADER,
+        value_name = "FILE",
+    )]
+    pub manifest_db_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -914,6 +923,7 @@ where
     filesystem_config.incremental_upload = args.incremental_upload;
     filesystem_config.s3_personality = s3_personality;
     filesystem_config.server_side_encryption = ServerSideEncryption::new(args.sse.clone(), args.sse_kms_key_id.clone());
+    filesystem_config.manifest_db_path = args.manifest_db_path.clone(); // TODO: accept path to CSV and convert it to an sqlite db
 
     let sys = System::new_with_specifics(RefreshKind::everything());
     let default_mem_target = (sys.total_memory() as f64 * 0.95) as u64;

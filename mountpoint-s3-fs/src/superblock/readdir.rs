@@ -44,6 +44,7 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 
+use crate::manifest::{Manifest, ManifestEntry};
 use mountpoint_s3_client::types::ObjectInfo;
 use mountpoint_s3_client::ObjectClient;
 use tracing::{error, trace, warn};
@@ -96,7 +97,14 @@ impl ReaddirHandle {
             }
         };
 
-        let iter = if inner.config.s3_personality.is_list_ordered() {
+        let iter = if let Some(manifest) = inner.manifest.as_ref() {
+            trace!("using manifest readdir iter");
+            ReaddirIter::manifest(
+                manifest,
+                &inner.bucket,
+                &full_path,
+            )?
+        } else if inner.config.s3_personality.is_list_ordered() {
             ReaddirIter::ordered(&inner.bucket, &full_path, page_size, local_entries.into())
         } else {
             ReaddirIter::unordered(&inner.bucket, &full_path, page_size, local_entries.into())
@@ -287,6 +295,7 @@ impl Ord for ReaddirEntry {
 enum ReaddirIter {
     Ordered(ordered::ReaddirIter),
     Unordered(unordered::ReaddirIter),
+    Manifest(manifest::ReaddirIter),
 }
 
 impl ReaddirIter {
@@ -298,10 +307,18 @@ impl ReaddirIter {
         Self::Unordered(unordered::ReaddirIter::new(bucket, full_path, page_size, local_entries))
     }
 
+    fn manifest(manifest: &Manifest, bucket: &str, full_path: &str) -> Result<Self, InodeError> {
+        Ok(Self::Manifest(manifest::ReaddirIter::new(
+            manifest.iter(bucket, full_path)?,
+            full_path.len(),
+        )))
+    }
+
     async fn next(&mut self, client: &impl ObjectClient) -> Result<Option<ReaddirEntry>, InodeError> {
         match self {
             Self::Ordered(iter) => iter.next(client).await,
             Self::Unordered(iter) => iter.next(client).await,
+            Self::Manifest(iter) => iter.next(),
         }
     }
 }
@@ -568,6 +585,60 @@ mod unordered {
             }
 
             Ok(self.local_iter.pop_front())
+        }
+    }
+}
+
+mod manifest {
+    use time::OffsetDateTime;
+
+    use crate::manifest::ManifestIter;
+
+    use super::*;
+
+    /// Adaptor for [ManifestIter], converts [ManifestEntry] to [ReaddirEntry]
+    #[derive(Debug)]
+    pub struct ReaddirIter {
+        manifest_iter: ManifestIter,
+        full_path_len: usize,
+    }
+
+    impl ReaddirIter {
+        pub(super) fn new(manifest_iter: ManifestIter, full_path_len: usize) -> Self {
+            Self {
+                manifest_iter,
+                full_path_len,
+            }
+        }
+
+        /// Return the next [ReaddirEntry] for the directory stream. If the stream is finished, returns
+        /// `Ok(None)`.
+        pub(super) fn next(&mut self) -> Result<Option<ReaddirEntry>, InodeError> {
+            let readdir_entry = match self.manifest_iter.next_entry()? {
+                Some(ManifestEntry::File { full_key, etag, size }) => {
+                    let name = full_key[self.full_path_len..].to_owned();
+                    let object_info = ObjectInfo {
+                        key: full_key.clone(),
+                        size: size as u64,
+                        last_modified: OffsetDateTime::now_utc(), // TODO: mount time
+                        // Intentionally leaving `storage_class` and `restore_status` empty,
+                        // which may result in EIO errors on read for GLACIER | DEEP_ARCHIVE objects
+                        storage_class: None,
+                        restore_status: None,
+                        etag: etag.clone(),
+                        // TODO, `checksum_algorithms` is currently ignored, but leaving the vector empty may be misleading in future:
+                        // https://github.com/awslabs/mountpoint-s3/blob/e85566e5bd85e295f490b5f80ae05f5d0fe966e3/mountpoint-s3-fs/src/superblock/readdir.rs#L177-L184
+                        checksum_algorithms: Default::default(),
+                    };
+                    Some(ReaddirEntry::RemoteObject { name, object_info })
+                }
+                Some(ManifestEntry::Directory { full_key, .. }) => {
+                    let name = full_key[self.full_path_len..full_key.len() - 1].to_owned();
+                    Some(ReaddirEntry::RemotePrefix { name })
+                }
+                None => None,
+            };
+            Ok(readdir_entry)
         }
     }
 }
