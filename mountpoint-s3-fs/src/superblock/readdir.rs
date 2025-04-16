@@ -100,11 +100,7 @@ impl ReaddirHandle {
 
         let iter = if let Some(manifest) = inner.manifest.as_ref() {
             trace!("using manifest readdir iter");
-            ReaddirIter::manifest(
-                manifest,
-                &inner.bucket,
-                &full_path,
-            )?
+            ReaddirIter::manifest(manifest, &inner.bucket, &full_path)?
         } else if inner.config.s3_personality.is_list_ordered() {
             ReaddirIter::ordered(&inner.bucket, &full_path, page_size, local_entries.into())
         } else {
