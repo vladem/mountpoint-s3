@@ -282,6 +282,10 @@ pub mod builder {
             }
         }
 
+        if !buffer.is_empty() {
+            db.insert_batch(&buffer)?;
+        }
+
         db.insert_directories()?;
         db.create_index()?;
         Ok(())
