@@ -396,6 +396,7 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
     )]
     pub bind: Option<Vec<String>>,
 
+    #[cfg(feature = "manifest")]
     #[clap(
         short,
         long,
@@ -923,7 +924,10 @@ where
     filesystem_config.incremental_upload = args.incremental_upload;
     filesystem_config.s3_personality = s3_personality;
     filesystem_config.server_side_encryption = ServerSideEncryption::new(args.sse.clone(), args.sse_kms_key_id.clone());
-    filesystem_config.manifest_db_path = args.manifest_db_path.clone(); // TODO: accept path to CSV and convert it to an sqlite db
+    #[cfg(feature = "manifest")]
+    {
+        filesystem_config.manifest_db_path = args.manifest_db_path.clone(); // TODO: accept path to CSV and convert it to an sqlite db
+    }
 
     let sys = System::new_with_specifics(RefreshKind::everything());
     let default_mem_target = (sys.total_memory() as f64 * 0.95) as u64;

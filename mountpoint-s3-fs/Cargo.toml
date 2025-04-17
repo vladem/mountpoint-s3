@@ -81,6 +81,7 @@ walkdir = "2.5.0"
 block_size = []
 event_log = []
 mem_limiter = []
+manifest = []
 # Features for choosing tests
 fips_tests = []
 fuse_tests = []
