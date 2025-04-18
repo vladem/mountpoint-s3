@@ -396,6 +396,7 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
     )]
     pub bind: Option<Vec<String>>,
 
+    // todo: this must require --read_only
     #[cfg(feature = "manifest")]
     #[clap(
         short,

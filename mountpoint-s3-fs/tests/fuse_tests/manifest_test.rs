@@ -1,9 +1,9 @@
 use crate::common::fuse::{self, read_dir_to_entry_names, TestClient, TestSessionConfig};
 #[cfg(feature = "s3_tests")]
 use crate::common::s3::{get_test_bucket_and_prefix, get_test_region, get_test_sdk_client};
-use mountpoint_s3_fs::manifest::builder::{create_db_from_slice, insert_row};
-use mountpoint_s3_fs::manifest::ManifestEntry;
+use mountpoint_s3_fs::manifest::{create_db_from_slice, DbEntry};
 use mountpoint_s3_fs::S3FilesystemConfig;
+use rusqlite::Connection;
 use std::fs::{self, metadata};
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
@@ -74,7 +74,7 @@ fn test_readdir_manifest_missing_metadata(etag: Option<&str>, size: Option<usize
     let key = "key";
     let (_tmp_dir, db_path) = create_dummy_manifest::<&str>(&[], 0);
     let test_session = fuse::mock_session::new("", manifest_test_session_config(&db_path));
-    insert_row(&db_path, (key, "", etag, size)).expect("insert invalid row must succeed");
+    insert_entries(&db_path, &[(key, "", etag, size)]).expect("insert invalid row must succeed");
 
     let mut read_dir_iter = fs::read_dir(test_session.mount_path()).unwrap();
     let e = read_dir_iter
@@ -116,7 +116,7 @@ fn test_lookup_manifest_missing_metadata(etag: Option<&str>, size: Option<usize>
     let key = "key";
     let (_tmp_dir, db_path) = create_dummy_manifest::<&str>(&[], 0);
     let test_session = fuse::mock_session::new("", manifest_test_session_config(&db_path));
-    insert_row(&db_path, (key, "", etag, size)).expect("insert invalid row must succeed");
+    insert_entries(&db_path, &[(key, "", etag, size)]).expect("insert invalid row must succeed");
 
     let e = metadata(test_session.mount_path().join(key)).expect_err("lookup must fail");
     assert_eq!(e.raw_os_error().expect("lookup must fail"), libc::EIO);
@@ -145,10 +145,10 @@ async fn test_basic_read_manifest_s3(readdir_before_read: bool, stat_before_read
     put_object(&sdk_client, &bucket, &prefix, invisible_object.0, invisible_object.1).await;
 
     // create manifest and do the mount
-    let (_tmp_dir, db_path) = create_manifest(&[ManifestEntry::File {
+    let (_tmp_dir, db_path) = create_manifest(&[DbEntry {
         full_key: format!("{}{}", prefix, visible_object.0),
-        etag: visible_object_props.0,
-        size: visible_object_props.1,
+        etag: Some(visible_object_props.0),
+        size: Some(visible_object_props.1),
     }]);
     let test_session =
         fuse::s3_session::new_with_test_client(manifest_test_session_config(&db_path), sdk_client, &bucket, &prefix);
@@ -206,14 +206,14 @@ async fn test_read_manifest_wrong_metadata(wrong_etag: bool, wrong_size: bool, e
     let sdk_client = get_test_sdk_client(&get_test_region()).await;
     let object_props = put_object(&sdk_client, &bucket, &prefix, object.0, object.1.clone()).await;
 
-    let (_tmp_dir, db_path) = create_manifest(&[ManifestEntry::File {
+    let (_tmp_dir, db_path) = create_manifest(&[DbEntry {
         full_key: format!("{}{}", prefix, object.0),
         etag: if wrong_etag {
-            "wrong_etag".to_string()
+            Some("wrong_etag".to_string())
         } else {
-            object_props.0
+            Some(object_props.0)
         },
-        size: if wrong_size { 2048 } else { object_props.1 }, // size smaller than actual will result in incomplete response
+        size: if wrong_size { Some(2048) } else { Some(object_props.1) }, // size smaller than actual will result in incomplete response
     }]);
     let test_session =
         fuse::s3_session::new_with_test_client(manifest_test_session_config(&db_path), sdk_client, &bucket, &prefix);
@@ -230,6 +230,21 @@ async fn test_read_manifest_wrong_metadata(wrong_etag: bool, wrong_size: bool, e
 // fn test_manifest_forbidden_operations() // including wrong open flags
 // fn test_fs_creation_no_manifest() // empty_manifest, wrong format
 
+// #[test_case(&["dir1/a.jpg", "dir1/dir2/b.jpg", "c.jpg"], &["dir1/", "dir2/"]; "simple")]
+// fn test_ingest_directories(object_keys: &[&str], dirs: &[&str]) {}
+
+// #[test]
+// fn test_ingest_shadowed() {
+// }
+
+// #[test]
+// fn test_ingest_invalid_key() {
+// }
+
+// #[test]
+// fn test_ingest_missing_metadata() {
+// }
+
 fn manifest_test_session_config(db_path: &Path) -> TestSessionConfig {
     TestSessionConfig {
         filesystem_config: S3FilesystemConfig {
@@ -243,10 +258,10 @@ fn manifest_test_session_config(db_path: &Path) -> TestSessionConfig {
 fn create_dummy_manifest<T: AsRef<str>>(s3_keys: &[T], file_size: usize) -> (TempDir, PathBuf) {
     let db_entries: Vec<_> = s3_keys
         .iter()
-        .map(|key| ManifestEntry::File {
+        .map(|key| DbEntry {
             full_key: key.as_ref().to_string(),
-            etag: "".to_owned(),
-            size: file_size,
+            etag: Some("\"3bebe4037c8f040e0e573e191d34b2c6\"".to_string()),
+            size: Some(file_size),
         })
         .collect();
 
@@ -260,7 +275,7 @@ fn put_dummy_objects<T: AsRef<str>>(test_client: &dyn TestClient, manifest_keys:
     }
 }
 
-fn create_manifest(db_entries: &[ManifestEntry]) -> (TempDir, PathBuf) {
+fn create_manifest(db_entries: &[DbEntry]) -> (TempDir, PathBuf) {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("s3_keys.db3");
 
@@ -299,4 +314,18 @@ async fn put_object(
 
     let size = head_resp.content_length().unwrap() as usize;
     (head_resp.e_tag.unwrap(), size)
+}
+
+fn insert_entries(
+    manifest_db_path: &Path,
+    entries: &[(&str, &str, Option<&str>, Option<usize>)],
+) -> rusqlite::Result<()> {
+    let conn = Connection::open(manifest_db_path).expect("must connect to a db");
+    conn.execute_batch("BEGIN TRANSACTION;")?;
+    let mut stmt = conn.prepare("INSERT INTO s3_objects (key, parent_key, etag, size) VALUES (?1, ?2, ?3, ?4)")?;
+    for entry in entries {
+        stmt.execute(*entry)?;
+    }
+    conn.execute_batch("COMMIT;")?;
+    Ok(())
 }

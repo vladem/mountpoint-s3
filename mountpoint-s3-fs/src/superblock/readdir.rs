@@ -658,7 +658,7 @@ mod manifest {
                     })
                 }
                 Some(ManifestEntry::Directory { full_key, .. }) => {
-                    let name = full_key[self.full_path_len..full_key.len() - 1].to_owned();
+                    let name = full_key[self.full_path_len..].to_owned();
                     Some(ReaddirEntry::RemotePrefix { name })
                 }
                 None => None,

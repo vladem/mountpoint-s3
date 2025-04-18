@@ -1,5 +1,5 @@
 use clap::Parser;
-use mountpoint_s3_fs::manifest::{builder::create_db_from_csv, ManifestError};
+use mountpoint_s3_fs::manifest::{create_db_from_csv, ManifestError};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
