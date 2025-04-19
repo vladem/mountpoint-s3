@@ -5,9 +5,11 @@ use thiserror::Error;
 use tracing::{error, trace};
 
 mod builder;
+mod csv_reader;
 mod db;
 
-pub use builder::{create_db_from_csv, create_db_from_slice};
+pub use builder::create_db;
+pub use csv_reader::CsvReader;
 pub use db::DbEntry;
 
 #[derive(Debug, Error)]
@@ -20,6 +22,14 @@ pub enum ManifestError {
     TooManyRows,
     #[error("invalid csv")]
     InvalidCsv,
+    #[error("input error")]
+    InputError,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum ManifestWarning {
+    #[error("key is shadowed and will be unavailable: {0}")]
+    ShadowedKey(String),
 }
 
 /// An entry returned by manifest_lookup() and ManifestIter::next()

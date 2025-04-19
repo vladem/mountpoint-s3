@@ -399,10 +399,10 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
     // todo: this must require --read_only
     #[cfg(feature = "manifest")]
     #[clap(
-        short,
         long,
         help = "Sqlite .db3 file with metadata for S3 objects",
         help_heading = MOUNT_OPTIONS_HEADER,
+        requires = "read_only",
         value_name = "FILE",
     )]
     pub manifest_db_path: Option<PathBuf>,

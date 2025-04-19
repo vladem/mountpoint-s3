@@ -1,9 +1,9 @@
-use rusqlite::{Connection, Result, Row};
+use rusqlite::{params_from_iter, Connection, Result, Row};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DbEntry {
     pub full_key: String,
     pub etag: Option<String>,
@@ -18,22 +18,7 @@ impl DbEntry {
             size: row.get(2)?,
         })
     }
-    /*
-        fn from_csv(csv_row: &str) -> Result<Self, ManifestError> {
-            let tokens: Vec<&str> = csv_row.trim().split(",").collect();
-            let decoded_key = Base64::decode_vec(tokens[0]).map_err(|_| ManifestError::InvalidCsv)?;
-            let decoded_key = String::from_utf8(decoded_key).map_err(|_| ManifestError::InvalidCsv)?;
-            if decoded_key.is_empty() {
-                Err(ManifestError::InvalidCsv)
-            } else {
-                Ok(Self::File {
-                    full_key: decoded_key,
-                    etag: tokens[1].to_owned(),
-                    size: tokens[2].parse::<usize>().map_err(|_| ManifestError::InvalidCsv)?,
-                })
-            }
-        }
-    */
+
     // Parent key without a trailing '/'
     fn parent_key(&self) -> &str {
         let key = self.full_key.trim_end_matches("/");
@@ -127,7 +112,10 @@ impl Db {
 
     /// Iterates over a sorted list of S3 object keys, infers and inserts the directories,
     /// deduplicating those based on the previous row.
-    pub(super) fn insert_directories(&self, batch_size: usize) -> Result<usize> {
+    ///
+    /// Returns the list of keys that were replaced (shadowed) during the process (maximum `batch_size` shadowed entries).
+    /// A unique index is assumed to be build at this point for shadowing to happen.
+    pub(super) fn insert_directories(&self, batch_size: usize) -> Result<Vec<DbEntry>> {
         let conn = self.conn.lock().expect("lock must succeed");
         let query = "SELECT key FROM s3_objects ORDER BY key";
         let mut stmt = conn.prepare(query)?;
@@ -136,44 +124,78 @@ impl Db {
             Ok(key)
         })?;
 
+        let insert = |db: &Self,
+                      conn: &MutexGuard<'_, Connection>,
+                      insert_buffer: &mut Vec<DbEntry>,
+                      shadowed: &mut Vec<DbEntry>|
+         -> Result<()> {
+            // we want to report shadowed keys back to user, but we have a memory constraint, so cap it at `batch_size`
+            if shadowed.len() < batch_size {
+                let mut new_shadowed = db.select_shadowed_locked(conn, insert_buffer)?;
+                new_shadowed.truncate(batch_size - shadowed.len());
+                shadowed.extend(new_shadowed);
+            }
+            db.insert_batch_locked(conn, insert_buffer)?;
+            insert_buffer.clear();
+            Ok(())
+        };
+
         let mut prev_s3_key: Option<String> = None;
+        let mut shadowed: Vec<DbEntry> = Default::default();
         let mut insert_buffer: Vec<DbEntry> = Default::default();
-        let mut total = 0;
         for s3_key in keys_iter {
             let s3_key = s3_key?;
             insert_buffer.extend(infer_directories(prev_s3_key.as_deref(), &s3_key));
             prev_s3_key = Some(s3_key);
 
             if insert_buffer.len() >= batch_size {
-                self.insert_batch_locked(&conn, &insert_buffer)?;
-                total += insert_buffer.len();
-                insert_buffer.clear();
+                insert(self, &conn, &mut insert_buffer, &mut shadowed)?;
             }
         }
 
         if !insert_buffer.is_empty() {
-            self.insert_batch_locked(&conn, &insert_buffer)?;
-            total += insert_buffer.len();
+            insert(self, &conn, &mut insert_buffer, &mut shadowed)?;
         }
 
-        Ok(total)
+        Ok(shadowed)
     }
 
     fn insert_batch_locked(&self, conn: &MutexGuard<'_, Connection>, entries: &[DbEntry]) -> Result<()> {
         conn.execute_batch("BEGIN TRANSACTION;")?;
-        let mut stmt = conn.prepare("INSERT INTO s3_objects (key, parent_key, etag, size) VALUES (?1, ?2, ?3, ?4)")?;
+        let mut stmt =
+            conn.prepare("INSERT OR REPLACE INTO s3_objects (key, parent_key, etag, size) VALUES (?1, ?2, ?3, ?4)")?;
         for entry in entries {
             stmt.execute((&entry.full_key, entry.parent_key(), entry.etag.as_deref(), entry.size))?;
         }
         conn.execute_batch("COMMIT;")?;
         Ok(())
     }
+
+    // From a list of new directories to be inserted find files that will be shadowed by those
+    fn select_shadowed_locked(&self, conn: &MutexGuard<'_, Connection>, entries: &[DbEntry]) -> Result<Vec<DbEntry>> {
+        let placeholders = std::iter::repeat("?")
+            .take(entries.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!("SELECT key, etag, size FROM s3_objects WHERE key in ({})", placeholders);
+        let mut stmt = conn.prepare(&query)?;
+        let keys: Vec<&str> = entries.iter().map(|entry| entry.full_key.as_str()).collect();
+        let result: rusqlite::Result<Vec<DbEntry>> = stmt
+            .query_map(params_from_iter(keys.iter()), DbEntry::from_row)?
+            .collect();
+        result
+    }
 }
 
+// From 2 subsequent keys in the sorted list infer new directories to be created, e.g:
+// dir1/dir2/dir3/dir4/c.jpg
+// dir1/dir5/d.jpg => dir5
 fn infer_directories(prev_s3_key: Option<&str>, s3_key: &str) -> Vec<DbEntry> {
     let mut insert_buffer: Vec<DbEntry> = Default::default();
-    let prev_components: Vec<&str> = if let Some(prev_s3_key) = &prev_s3_key {
-        prev_s3_key.split("/").collect()
+    let prev_components = if let Some(prev_s3_key) = &prev_s3_key {
+        let mut prev_components: Vec<_> = prev_s3_key.split("/").collect();
+        prev_components.pop(); // remove last component, i.e. name of the file
+        prev_components
     } else {
         Default::default()
     };
