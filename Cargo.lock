@@ -2935,6 +2935,7 @@ dependencies = [
  "rand_chacha",
  "regex",
  "rusqlite",
+ "rusty-fork",
  "serde",
  "serde_json",
  "serial_test",

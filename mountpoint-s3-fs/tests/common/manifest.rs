@@ -79,3 +79,10 @@ pub fn select_all(manifest_db_path: &Path) -> rusqlite::Result<Vec<TestDbEntry>>
     let result: rusqlite::Result<Vec<TestDbEntry>> = stmt.query_map((), TestDbEntry::from_row)?.collect();
     result
 }
+
+pub fn count_all(manifest_db_path: &Path) -> rusqlite::Result<usize> {
+    let conn = Connection::open(manifest_db_path).expect("must connect to a db");
+    let query = "SELECT count(*) FROM s3_objects ORDER BY key";
+    let mut stmt = conn.prepare(query)?;
+    stmt.query_row((), |row| row.get(0))
+}
