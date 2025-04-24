@@ -33,19 +33,19 @@ fn test_ingest_many_keys_base(
     max_duration_s: u64,
     max_mem_usage_mb: u64,
 ) {
-    let (_tmp_dir, db_path, _) =
-        monitor_with_timeout(Duration::from_secs(max_duration_s), max_mem_usage_mb, move || {
-            create_manifest(
-                (0..input_keys_num).map(key_generator).map(|key| {
-                    Ok(DbEntry {
-                        full_key: key,
-                        etag: Some(DUMMY_ETAG.to_string()),
-                        size: Some(DUMMY_SIZE),
-                    })
-                }),
-                BATCH_SIZE,
-            )
-        });
+    let (_tmp_dir, db_path) = monitor_with_timeout(Duration::from_secs(max_duration_s), max_mem_usage_mb, move || {
+        create_manifest(
+            (0..input_keys_num).map(key_generator).map(|key| {
+                Ok(DbEntry {
+                    full_key: key,
+                    etag: Some(DUMMY_ETAG.to_string()),
+                    size: Some(DUMMY_SIZE),
+                })
+            }),
+            BATCH_SIZE,
+        )
+        .expect("manifest must be created")
+    });
 
     let actual_output_keys_num = count_all(&db_path).expect("must count all objects");
     assert_eq!(actual_output_keys_num, output_keys_num);
