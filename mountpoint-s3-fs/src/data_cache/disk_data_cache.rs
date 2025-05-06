@@ -343,9 +343,13 @@ impl DiskDataCache {
         Ok(())
     }
 
-    fn remove_block_from_usage(&self, block_key: &DiskBlockKey) {
-        if let Some(usage) = &self.usage {
-            usage.lock().unwrap().remove(block_key);
+    fn remove_block_from_usage_locked(
+        &self,
+        block_key: &DiskBlockKey,
+        usage: Option<crate::sync::MutexGuard<'_, UsageInfo<DiskBlockKey>>>,
+    ) {
+        if let Some(mut usage) = usage {
+            usage.remove(block_key);
         }
     }
 }
@@ -397,13 +401,34 @@ impl DataCache for DiskDataCache {
                 // Invalid block. Count as cache miss.
                 metrics::counter!("disk_data_cache.block_hit").increment(0);
                 metrics::counter!("disk_data_cache.block_err").increment(1);
+                // (issue with cache size growing larger than expected)
+                //
+                // sequential, expected case:
+                //
+                // put_block()
+                // (1) fs.write(block)
+                // (2) usage.write(key)
+                // get_block() (here)
+                // (3) fs.remove_file(&path)
+                // (4) usage.remove(key)
+                //
+                // overlapped, race condition (!):
+                // (3) fs.remove_file(&path)
+                // (1) fs.write(block)
+                // (2) usage.write(key)     **lost update**
+                // (4) usage.remove(key)
+                //
+                // if the sequence is (4) *then* (3), there is *no* issue (like in [DiskDataCache::evict_if_needed])
+                //
+                // resolution: we make (3) and (4) *atomic* (no writes to *usage* in between)
+                let usage = self.usage.as_ref().map(|usage| usage.lock().unwrap());
                 match fs::remove_file(&path) {
-                    Ok(()) => self.remove_block_from_usage(&block_key),
+                    Ok(()) => self.remove_block_from_usage_locked(&block_key, usage),
                     Err(remove_err) => {
                         // We failed to delete the block.
                         if remove_err.kind() == ErrorKind::NotFound {
                             // No need to report or try again.
-                            self.remove_block_from_usage(&block_key);
+                            self.remove_block_from_usage_locked(&block_key, usage);
                         }
                         warn!("unable to remove invalid block: {:?}", remove_err);
                     }
