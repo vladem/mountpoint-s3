@@ -46,6 +46,7 @@ pub struct S3FilesystemConfig {
     /// An SQLite DB containing the list of S3 keys available with this mount
     #[cfg(feature = "manifest")]
     pub manifest: Option<Manifest>,
+    pub event_logger: Option<crate::logging::event_log::EventLogger>,
 }
 
 impl Default for S3FilesystemConfig {
@@ -71,6 +72,7 @@ impl Default for S3FilesystemConfig {
             prefetcher_config: Default::default(),
             #[cfg(feature = "manifest")]
             manifest: None,
+            event_logger: None,
         }
     }
 }

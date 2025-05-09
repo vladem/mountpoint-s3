@@ -38,6 +38,7 @@ impl MountpointConfig {
         s3_path: S3Path,
         client: Client,
         runtime: Runtime,
+        error_callback: Option<crate::fuse::ErrorCallback>,
     ) -> anyhow::Result<FuseSession>
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
@@ -53,7 +54,7 @@ impl MountpointConfig {
             self.filesystem_config,
         );
 
-        let fuse_fs = S3FuseFilesystem::new(fs);
+        let fuse_fs = S3FuseFilesystem::new(fs, error_callback);
         FuseSession::new(fuse_fs, self.fuse_session_config)
     }
 }

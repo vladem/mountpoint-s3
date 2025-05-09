@@ -10,6 +10,7 @@ use mountpoint_s3_client::user_agent::UserAgent;
 use mountpoint_s3_fs::data_cache::{CacheLimit, DataCacheConfig, DiskDataCacheConfig, ExpressDataCacheConfig};
 use mountpoint_s3_fs::fs::{CacheConfig, ServerSideEncryption, TimeToLive};
 use mountpoint_s3_fs::fuse::config::{FuseOptions, FuseSessionConfig, MountPoint};
+use mountpoint_s3_fs::logging::event_log::EventLogger;
 use mountpoint_s3_fs::logging::{prepare_log_file_name, LoggingConfig};
 use mountpoint_s3_fs::mem_limiter::MINIMUM_MEM_LIMIT;
 use mountpoint_s3_fs::prefix::Prefix;
@@ -485,7 +486,12 @@ impl CliArgs {
         }
     }
 
-    pub fn filesystem_config(&self, sse: ServerSideEncryption, s3_personality: S3Personality) -> S3FilesystemConfig {
+    pub fn filesystem_config(
+        &self,
+        sse: ServerSideEncryption,
+        s3_personality: S3Personality,
+        event_logger: Option<EventLogger>,
+    ) -> S3FilesystemConfig {
         let mut filesystem_config = S3FilesystemConfig::default();
         if let Some(uid) = self.uid {
             filesystem_config.uid = uid;
@@ -508,6 +514,7 @@ impl CliArgs {
         filesystem_config.cache_config = self.cache_config();
         filesystem_config.mem_limit = self.mem_limit();
         filesystem_config.use_upload_checksums = self.should_use_upload_checksum(s3_personality);
+        filesystem_config.event_logger = event_logger;
         filesystem_config
     }
 

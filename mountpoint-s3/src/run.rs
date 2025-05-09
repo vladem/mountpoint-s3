@@ -186,7 +186,15 @@ where
     tracing::debug!("using S3 personality {s3_personality:?} for {bucket_description}");
 
     let s3_path = args.s3_path();
-    let filesystem_config = args.filesystem_config(sse.clone(), s3_personality);
+    let event_logger = if let Some(log_directory) = args.log_directory.as_ref() {
+        Some(mountpoint_s3_fs::logging::event_log::EventLogger::new(log_directory)?)
+    } else {
+        None
+    };
+    let error_callback = event_logger
+        .as_ref()
+        .map(|event_logger| event_logger.log_error_callback());
+    let filesystem_config = args.filesystem_config(sse.clone(), s3_personality, event_logger);
     let mut data_cache_config = args.data_cache_config(sse);
 
     let managed_cache_dir = setup_disk_cache_directory(&mut data_cache_config)?;
@@ -195,7 +203,7 @@ where
     let mount_point_path = format!("{}", fuse_session_config.mount_point());
 
     let mut fuse_session = MountpointConfig::new(fuse_session_config, filesystem_config, data_cache_config)
-        .create_fuse_session(s3_path, client, runtime)?;
+        .create_fuse_session(s3_path, client, runtime, error_callback)?;
     tracing::info!("successfully mounted {} at {}", bucket_description, mount_point_path);
 
     if let Some(managed_cache_dir) = managed_cache_dir {
