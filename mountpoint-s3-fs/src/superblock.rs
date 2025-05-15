@@ -64,12 +64,12 @@ pub use readdir::ReaddirHandle;
 
 /// Superblock is the root object of the file system
 #[derive(Debug)]
-pub struct Superblock {
-    inner: Arc<SuperblockInner>,
+pub struct Superblock<OC: ObjectClient> {
+    inner: Arc<SuperblockInner<OC>>,
 }
 
 #[derive(Debug)]
-struct SuperblockInner {
+struct SuperblockInner<OC: ObjectClient> {
     bucket: String,
     prefix: Prefix,
     inodes: RwLock<InodeMap>,
@@ -77,6 +77,7 @@ struct SuperblockInner {
     next_ino: AtomicU64,
     mount_time: OffsetDateTime,
     config: SuperblockConfig,
+    client: OC,
 }
 
 /// Configuration for superblock operations
@@ -88,9 +89,9 @@ pub struct SuperblockConfig {
     pub manifest: Option<Manifest>,
 }
 
-impl Superblock {
+impl<OC: ObjectClient> Superblock<OC> {
     /// Create a new Superblock that targets the given bucket/prefix
-    pub fn new(bucket: &str, prefix: &Prefix, config: SuperblockConfig) -> Self {
+    pub fn new(client: OC, bucket: &str, prefix: &Prefix, config: SuperblockConfig) -> Self {
         let mount_time = OffsetDateTime::now_utc();
         let root = Inode::new_root(prefix, mount_time);
 
@@ -110,6 +111,7 @@ impl Superblock {
             next_ino: AtomicU64::new(2),
             mount_time,
             config,
+            client,
         };
         Self { inner: Arc::new(inner) }
     }
@@ -177,17 +179,12 @@ impl Superblock {
 
     /// Lookup an inode in the parent directory with the given name and
     /// increments its lookup count.
-    pub async fn lookup<OC: ObjectClient>(
-        &self,
-        client: &OC,
-        parent_ino: InodeNo,
-        name: &OsStr,
-    ) -> Result<LookedUp, InodeError> {
+    pub async fn lookup(&self, parent_ino: InodeNo, name: &OsStr) -> Result<LookedUp, InodeError> {
         trace!(parent=?parent_ino, ?name, "lookup");
         let lookup = self
             .inner
             .lookup_by_name(
-                client,
+                &self.inner.client,
                 parent_ino,
                 name,
                 self.inner.config.cache_config.serve_lookup_from_cache,
@@ -198,12 +195,7 @@ impl Superblock {
     }
 
     /// Retrieve the attributes for an inode
-    pub async fn getattr<OC: ObjectClient>(
-        &self,
-        client: &OC,
-        ino: InodeNo,
-        force_revalidate: bool,
-    ) -> Result<LookedUp, InodeError> {
+    pub async fn getattr(&self, ino: InodeNo, force_revalidate: bool) -> Result<LookedUp, InodeError> {
         let inode = self.inner.get(ino)?;
         logging::record_name(inode.name());
 
@@ -218,7 +210,7 @@ impl Superblock {
 
         let lookup = self
             .inner
-            .lookup_by_name(client, inode.parent(), inode.name().as_ref(), false)
+            .lookup_by_name(&self.inner.client, inode.parent(), inode.name().as_ref(), false)
             .await?;
         if lookup.inode.ino() != ino {
             Err(InodeError::StaleInode {
@@ -232,7 +224,7 @@ impl Superblock {
     }
 
     /// Set the attributes for an inode
-    pub async fn setattr<OC: ObjectClient>(
+    pub async fn setattr(
         &self,
         _client: &OC,
         ino: InodeNo,
@@ -394,12 +386,12 @@ impl Superblock {
     /// Start a readdir stream for the given directory inode
     ///
     /// Doesn't currently do any IO, so doesn't need to be async, but reserving it for future use.
-    pub async fn readdir<OC: ObjectClient>(
+    pub async fn readdir(
         &self,
         _client: &OC,
         dir_ino: InodeNo,
         page_size: usize,
-    ) -> Result<ReaddirHandle, InodeError> {
+    ) -> Result<ReaddirHandle<OC>, InodeError> {
         trace!(dir=?dir_ino, "readdir");
 
         let dir = self.inner.get(dir_ino)?;
@@ -415,7 +407,7 @@ impl Superblock {
     }
 
     /// Create a new regular file or directory inode ready to be opened in write-only mode
-    pub async fn create<OC: ObjectClient>(
+    pub async fn create(
         &self,
         client: &OC,
         dir: InodeNo,
@@ -485,12 +477,7 @@ impl Superblock {
 
     /// Remove local-only empty directory, i.e., the ones created by mkdir.
     /// It does not affect empty directories represented remotely with directory markers.
-    pub async fn rmdir<OC: ObjectClient>(
-        &self,
-        client: &OC,
-        parent_ino: InodeNo,
-        name: &OsStr,
-    ) -> Result<(), InodeError> {
+    pub async fn rmdir(&self, client: &OC, parent_ino: InodeNo, name: &OsStr) -> Result<(), InodeError> {
         let LookedUp { inode, .. } = self
             .inner
             .lookup_by_name(
@@ -558,12 +545,7 @@ impl Superblock {
     /// We know that the Linux Kernel's VFS will lock both the parent and child,
     /// so we can safely ignore concurrent operations within the same Mountpoint process to the file and its parent.
     /// See: https://www.kernel.org/doc/html/next/filesystems/directory-locking.html
-    pub async fn unlink<OC: ObjectClient>(
-        &self,
-        client: &OC,
-        parent_ino: InodeNo,
-        name: &OsStr,
-    ) -> Result<(), InodeError> {
+    pub async fn unlink(&self, client: &OC, parent_ino: InodeNo, name: &OsStr) -> Result<(), InodeError> {
         let parent = self.inner.get(parent_ino)?;
         let LookedUp { inode, .. } = self
             .inner
@@ -644,7 +626,7 @@ impl Superblock {
     }
 }
 
-impl SuperblockInner {
+impl<OC: ObjectClient> SuperblockInner<OC> {
     /// Retrieve the inode for the given number if it exists.
     ///
     /// The expiry of its stat field is not checked.
@@ -681,7 +663,7 @@ impl SuperblockInner {
     /// Updates the parent inode to be in sync with the client, but does
     /// not add new inodes to the superblock. The caller is responsible
     /// for calling [`remember()`] if that is required.
-    pub async fn lookup_by_name<OC: ObjectClient>(
+    pub async fn lookup_by_name(
         &self,
         client: &OC,
         parent_ino: InodeNo,
@@ -706,7 +688,7 @@ impl SuperblockInner {
                     self.remote_lookup(client, parent_ino, name).await?
                 };
                 #[cfg(not(feature = "manifest"))]
-                let remote = self.remote_lookup(client, parent_ino, &name).await?;
+                let remote = self.remote_lookup(client, parent_ino, name).await?;
                 self.update_from_remote(parent_ino, name, remote)?
             }
         };
@@ -720,8 +702,8 @@ impl SuperblockInner {
     /// If no record for the given `name` is found, returns [None].
     /// If an entry is found in the negative cache, returns [Some(Err(InodeError::FileDoesNotExist))].
     fn cache_lookup(&self, parent_ino: InodeNo, name: &str) -> Option<Result<LookedUp, InodeError>> {
-        fn do_cache_lookup(
-            superblock: &SuperblockInner,
+        fn do_cache_lookup<O: ObjectClient>(
+            superblock: &SuperblockInner<O>,
             parent: Inode,
             name: &str,
         ) -> Option<Result<LookedUp, InodeError>> {
@@ -804,7 +786,7 @@ impl SuperblockInner {
 
     /// Lookup an inode in the parent directory with the given name
     /// on the remote client.
-    async fn remote_lookup<OC: ObjectClient>(
+    async fn remote_lookup(
         &self,
         client: &OC,
         parent_ino: InodeNo,
@@ -1363,12 +1345,12 @@ mod tests {
 
         let prefix = Prefix::new(prefix).expect("valid prefix");
         let ts = OffsetDateTime::now_utc();
-        let superblock = Superblock::new(bucket, &prefix, Default::default());
+        let superblock = Superblock::new(client.clone(), bucket, &prefix, Default::default());
 
         // Try it twice to test the inode reuse path too
         for _ in 0..2 {
             let dir0 = superblock
-                .lookup(&client, FUSE_ROOT_INODE, &OsString::from("dir0"))
+                .lookup(FUSE_ROOT_INODE, &OsString::from("dir0"))
                 .await
                 .expect("should exist");
             assert_inode_stat!(dir0, InodeKind::Directory, ts, 0);
@@ -1378,7 +1360,7 @@ mod tests {
             );
 
             let dir1 = superblock
-                .lookup(&client, FUSE_ROOT_INODE, &OsString::from("dir1"))
+                .lookup(FUSE_ROOT_INODE, &OsString::from("dir1"))
                 .await
                 .expect("should exist");
             assert_inode_stat!(dir1, InodeKind::Directory, ts, 0);
@@ -1388,7 +1370,7 @@ mod tests {
             );
 
             let sdir0 = superblock
-                .lookup(&client, dir0.inode.ino(), &OsString::from("sdir0"))
+                .lookup(dir0.inode.ino(), &OsString::from("sdir0"))
                 .await
                 .expect("should exist");
             assert_inode_stat!(sdir0, InodeKind::Directory, ts, 0);
@@ -1398,7 +1380,7 @@ mod tests {
             );
 
             let sdir1 = superblock
-                .lookup(&client, dir0.inode.ino(), &OsString::from("sdir1"))
+                .lookup(dir0.inode.ino(), &OsString::from("sdir1"))
                 .await
                 .expect("should exist");
             assert_inode_stat!(sdir1, InodeKind::Directory, ts, 0);
@@ -1408,7 +1390,7 @@ mod tests {
             );
 
             let sdir2 = superblock
-                .lookup(&client, dir1.inode.ino(), &OsString::from("sdir2"))
+                .lookup(dir1.inode.ino(), &OsString::from("sdir2"))
                 .await
                 .expect("should exist");
             assert_inode_stat!(sdir2, InodeKind::Directory, ts, 0);
@@ -1418,7 +1400,7 @@ mod tests {
             );
 
             let sdir3 = superblock
-                .lookup(&client, dir1.inode.ino(), &OsString::from("sdir3"))
+                .lookup(dir1.inode.ino(), &OsString::from("sdir3"))
                 .await
                 .expect("should exist");
             assert_inode_stat!(sdir3, InodeKind::Directory, ts, 0);
@@ -1435,7 +1417,7 @@ mod tests {
             ] {
                 for i in 0..*n {
                     let file = superblock
-                        .lookup(&client, *ino, &OsString::from(format!("file{i}.txt")))
+                        .lookup(*ino, &OsString::from(format!("file{i}.txt")))
                         .await
                         .expect("inode should exist");
                     // Grab last modified time according to mock S3
@@ -1487,6 +1469,7 @@ mod tests {
             std::time::Duration::ZERO
         };
         let superblock = Superblock::new(
+            client.clone(),
             bucket,
             &prefix,
             SuperblockConfig {
@@ -1499,7 +1482,7 @@ mod tests {
         let entries = ["file0.txt", "sdir0"];
         for entry in entries {
             _ = superblock
-                .lookup(&client, FUSE_ROOT_INODE, entry.as_ref())
+                .lookup(FUSE_ROOT_INODE, entry.as_ref())
                 .await
                 .expect("should exist");
         }
@@ -1509,7 +1492,7 @@ mod tests {
         }
 
         for entry in entries {
-            let lookup = superblock.lookup(&client, FUSE_ROOT_INODE, entry.as_ref()).await;
+            let lookup = superblock.lookup(FUSE_ROOT_INODE, entry.as_ref()).await;
             if cached {
                 lookup.expect("inode should still be served from cache");
             } else {
@@ -1538,6 +1521,7 @@ mod tests {
             std::time::Duration::ZERO
         };
         let superblock = Superblock::new(
+            client.clone(),
             bucket,
             &prefix,
             SuperblockConfig {
@@ -1550,7 +1534,7 @@ mod tests {
         let entries = ["file0.txt", "sdir0"];
         for entry in entries {
             _ = superblock
-                .lookup(&client, FUSE_ROOT_INODE, entry.as_ref())
+                .lookup(FUSE_ROOT_INODE, entry.as_ref())
                 .await
                 .expect_err("should not exist");
         }
@@ -1571,7 +1555,7 @@ mod tests {
         }
 
         for entry in entries {
-            let lookup = superblock.lookup(&client, FUSE_ROOT_INODE, entry.as_ref()).await;
+            let lookup = superblock.lookup(FUSE_ROOT_INODE, entry.as_ref()).await;
             if cached {
                 lookup.expect_err("negative entry should still be valid in the cache, so the new key should not have been looked up in S3");
             } else {
@@ -1614,7 +1598,7 @@ mod tests {
 
         let prefix = Prefix::new(prefix).expect("valid prefix");
         let ts = OffsetDateTime::now_utc();
-        let superblock = Superblock::new("test_bucket", &prefix, Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &prefix, Default::default());
 
         // Try it all twice to test inode reuse
         for _ in 0..2 {
@@ -1666,7 +1650,7 @@ mod tests {
         let client = Arc::new(MockClient::new(client_config));
 
         let prefix = Prefix::new(prefix).expect("valid prefix");
-        let superblock = Superblock::new("test_bucket", &prefix, Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &prefix, Default::default());
 
         let mut expected_list = Vec::new();
 
@@ -1707,7 +1691,7 @@ mod tests {
         let client = Arc::new(MockClient::new(client_config));
 
         let prefix = Prefix::new(prefix).expect("valid prefix");
-        let superblock = Superblock::new("test_bucket", &prefix, Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &prefix, Default::default());
 
         let mut expected_list = Vec::new();
 
@@ -1758,7 +1742,7 @@ mod tests {
         };
         let client = Arc::new(MockClient::new(client_config));
         let prefix = Prefix::new(prefix).expect("valid prefix");
-        let superblock = Superblock::new("test_bucket", &prefix, Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &prefix, Default::default());
 
         // Create local directory
         let dirname = "local_dir";
@@ -1768,7 +1752,7 @@ mod tests {
             .unwrap();
 
         let lookedup = superblock
-            .lookup(&client, FUSE_ROOT_INODE, dirname.as_ref())
+            .lookup(FUSE_ROOT_INODE, dirname.as_ref())
             .await
             .expect("lookup should succeed on local dirs");
         assert_eq!(
@@ -1803,7 +1787,7 @@ mod tests {
         };
         let client = Arc::new(MockClient::new(client_config));
         let prefix = Prefix::new(prefix).expect("valid prefix");
-        let superblock = Superblock::new("test_bucket", &prefix, Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &prefix, Default::default());
 
         // Create local directory
         let dirname = "local_dir";
@@ -1818,7 +1802,7 @@ mod tests {
             .expect("rmdir on empty local directory should succeed");
 
         superblock
-            .lookup(&client, FUSE_ROOT_INODE, dirname.as_ref())
+            .lookup(FUSE_ROOT_INODE, dirname.as_ref())
             .await
             .expect_err("should not do lookup on removed directory");
 
@@ -1828,7 +1812,7 @@ mod tests {
             .expect_err("should not do readdir on removed directory");
 
         superblock
-            .getattr(&client, inode.ino(), false)
+            .getattr(inode.ino(), false)
             .await
             .expect_err("should not do getattr on removed directory");
     }
@@ -1854,6 +1838,7 @@ mod tests {
             S3Personality::ExpressOneZone
         };
         let superblock = Superblock::new(
+            client.clone(),
             "test_bucket",
             &prefix,
             SuperblockConfig {
@@ -1962,7 +1947,7 @@ mod tests {
         };
         let client = Arc::new(MockClient::new(client_config));
         let prefix = Prefix::new(prefix).expect("valid prefix");
-        let superblock = Superblock::new("test_bucket", &prefix, Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &prefix, Default::default());
 
         // Create local directory
         let dirname = "local_dir";
@@ -2008,7 +1993,7 @@ mod tests {
         };
         let client = Arc::new(MockClient::new(client_config));
         let prefix = Prefix::new(prefix).expect("valid prefix");
-        let superblock = Superblock::new("test_bucket", &prefix, Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &prefix, Default::default());
 
         // Create local directory
         let dirname = "local_dir";
@@ -2048,7 +2033,7 @@ mod tests {
         };
         let client = Arc::new(MockClient::new(client_config));
         let prefix = Prefix::new(prefix).expect("valid prefix");
-        let superblock = Superblock::new("test_bucket", &prefix, Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &prefix, Default::default());
 
         let file_name = "file.txt";
         let file_key = format!("{prefix}{file_name}");
@@ -2056,7 +2041,7 @@ mod tests {
         let parent_ino = FUSE_ROOT_INODE;
 
         superblock
-            .lookup(&client, parent_ino, file_name.as_ref())
+            .lookup(parent_ino, file_name.as_ref())
             .await
             .expect("file should exist");
 
@@ -2066,7 +2051,7 @@ mod tests {
             .expect("file delete should succeed as it exists");
 
         let err: i32 = superblock
-            .lookup(&client, parent_ino, file_name.as_ref())
+            .lookup(parent_ino, file_name.as_ref())
             .await
             .expect_err("lookup should no longer find deleted file")
             .to_errno();
@@ -2081,7 +2066,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(MockClient::new(client_config));
-        let superblock = Superblock::new("test_bucket", &Default::default(), Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &Default::default(), Default::default());
 
         let nested_dirs = (0..5).map(|i| format!("level{i}")).collect::<Vec<_>>();
         let leaf_dir_ino = {
@@ -2124,7 +2109,7 @@ mod tests {
 
         // All nested dirs disappear
         let dirname = nested_dirs.first().unwrap();
-        let lookedup = superblock.lookup(&client, FUSE_ROOT_INODE, dirname.as_ref()).await;
+        let lookedup = superblock.lookup(FUSE_ROOT_INODE, dirname.as_ref()).await;
         assert!(matches!(lookedup, Err(InodeError::FileDoesNotExist(_, _))));
     }
 
@@ -2138,25 +2123,19 @@ mod tests {
         let client = Arc::new(MockClient::new(client_config));
         client.add_object("dir1/file1.txt", MockObject::constant(0xaa, 30, ETag::for_tests()));
 
-        let superblock = Superblock::new("test_bucket", &Default::default(), Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &Default::default(), Default::default());
 
         for _ in 0..2 {
-            let dir1_1 = superblock
-                .lookup(&client, FUSE_ROOT_INODE, "dir1".as_ref())
-                .await
-                .unwrap();
-            let dir1_2 = superblock
-                .lookup(&client, FUSE_ROOT_INODE, "dir1".as_ref())
-                .await
-                .unwrap();
+            let dir1_1 = superblock.lookup(FUSE_ROOT_INODE, "dir1".as_ref()).await.unwrap();
+            let dir1_2 = superblock.lookup(FUSE_ROOT_INODE, "dir1".as_ref()).await.unwrap();
             assert_eq!(dir1_1.inode.ino(), dir1_2.inode.ino());
 
             let file1_1 = superblock
-                .lookup(&client, dir1_1.inode.ino(), "file1.txt".as_ref())
+                .lookup(dir1_1.inode.ino(), "file1.txt".as_ref())
                 .await
                 .unwrap();
             let file1_2 = superblock
-                .lookup(&client, dir1_1.inode.ino(), "file1.txt".as_ref())
+                .lookup(dir1_1.inode.ino(), "file1.txt".as_ref())
                 .await
                 .unwrap();
             assert_eq!(file1_1.inode.ino(), file1_2.inode.ino());
@@ -2187,7 +2166,7 @@ mod tests {
             MockObject::constant(0xaa, 30, ETag::for_tests()),
         );
 
-        let superblock = Superblock::new("test_bucket", &Default::default(), Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &Default::default(), Default::default());
 
         let dir_handle = superblock.readdir(&client, FUSE_ROOT_INODE, 2).await.unwrap();
         let entries = dir_handle.collect(&client).await.unwrap();
@@ -2196,10 +2175,7 @@ mod tests {
             &["dir", "dir-1"]
         );
 
-        let dir = superblock
-            .lookup(&client, FUSE_ROOT_INODE, "dir".as_ref())
-            .await
-            .unwrap();
+        let dir = superblock.lookup(FUSE_ROOT_INODE, "dir".as_ref()).await.unwrap();
         assert_eq!(superblock.full_key_for_inode(&dir.inode).as_ref(), "dir/");
     }
 
@@ -2235,7 +2211,7 @@ mod tests {
             MockObject::constant(0xaa, 30, ETag::from_str("test_etag_5").unwrap()),
         );
 
-        let superblock = Superblock::new("test_bucket", &Default::default(), Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &Default::default(), Default::default());
         let dir_handle = superblock.readdir(&client, FUSE_ROOT_INODE, 2).await.unwrap();
         let entries = dir_handle.collect(&client).await.unwrap();
         assert_eq!(
@@ -2254,7 +2230,7 @@ mod tests {
 
         // Neither of these keys should exist in the directory
         for key in ["/", "."] {
-            let lookup = superblock.lookup(&client, dir1_ino, key.as_ref()).await;
+            let lookup = superblock.lookup(dir1_ino, key.as_ref()).await;
             assert!(matches!(lookup, Err(InodeError::InvalidFileName(_))));
         }
     }
@@ -2270,7 +2246,7 @@ mod tests {
         };
         let client = Arc::new(MockClient::new(client_config));
         let prefix = Prefix::new(prefix).expect("valid prefix");
-        let superblock = Superblock::new("test_bucket", &prefix, Default::default());
+        let superblock = Superblock::new(client.clone(), "test_bucket", &prefix, Default::default());
 
         // Create a new file
         let filename = "newfile.txt";
@@ -2297,7 +2273,7 @@ mod tests {
         assert_eq!(stat.mtime, mtime);
 
         let lookup = superblock
-            .getattr(&client, new_inode.inode.ino(), false)
+            .getattr(new_inode.inode.ino(), false)
             .await
             .expect("getattr should be successful");
         let stat = lookup.stat;
