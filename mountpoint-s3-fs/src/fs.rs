@@ -349,7 +349,7 @@ where
             mtime,
             size
         );
-        let setattr_result = self.superblock.setattr(&self.client, ino, atime, mtime).await;
+        let setattr_result = self.superblock.setattr(ino, atime, mtime).await;
         let lookup = match (setattr_result, size) {
             (Ok(lookup), _) => lookup,
             (Err(InodeError::SetAttrNotPermittedOnRemoteInode(_)), Some(0)) if !self.config.allow_overwrite => {
@@ -494,10 +494,7 @@ where
             ));
         }
 
-        let lookup = self
-            .superblock
-            .create(&self.client, parent, name, InodeKind::File)
-            .await?;
+        let lookup = self.superblock.create(parent, name, InodeKind::File).await?;
         debug!(ino = lookup.inode.ino(), "new inode created");
         let attr = self.make_attr(&lookup);
         Ok(Entry {
@@ -508,10 +505,7 @@ where
     }
 
     pub async fn mkdir(&self, parent: InodeNo, name: &OsStr, _mode: libc::mode_t, _umask: u32) -> Result<Entry, Error> {
-        let lookup = self
-            .superblock
-            .create(&self.client, parent, name, InodeKind::Directory)
-            .await?;
+        let lookup = self.superblock.create(parent, name, InodeKind::Directory).await?;
         let attr = self.make_attr(&lookup);
         Ok(Entry {
             ttl: lookup.validity(),
@@ -563,7 +557,7 @@ where
 
     /// Creates a new ReaddirHandle for the provided parent and default page size
     async fn readdir_handle(&self, parent: InodeNo) -> Result<ReaddirHandle<Client>, InodeError> {
-        self.superblock.readdir(&self.client, parent, 1000).await
+        self.superblock.readdir(parent, 1000).await
     }
 
     pub async fn opendir(&self, parent: InodeNo, _flags: i32) -> Result<Opened, Error> {
@@ -870,7 +864,7 @@ where
     }
 
     pub async fn rmdir(&self, parent_ino: InodeNo, name: &OsStr) -> Result<(), Error> {
-        self.superblock.rmdir(&self.client, parent_ino, name).await?;
+        self.superblock.rmdir(parent_ino, name).await?;
         Ok(())
     }
 
@@ -889,7 +883,7 @@ where
                 "Deletes are disabled. Use '--allow-delete' mount option to enable it."
             ));
         }
-        Ok(self.superblock.unlink(&self.client, parent_ino, name).await?)
+        Ok(self.superblock.unlink(parent_ino, name).await?)
     }
 
     pub async fn statfs(&self, _ino: InodeNo) -> Result<StatFs, Error> {

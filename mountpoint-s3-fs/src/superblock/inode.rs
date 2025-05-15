@@ -616,7 +616,7 @@ mod tests {
         }
 
         let err = superblock
-            .unlink(&client, parent_ino, file_name.as_ref())
+            .unlink(parent_ino, file_name.as_ref())
             .await
             .expect_err("unlink of a corrupted inode should fail");
         assert!(matches!(err, InodeError::CorruptedMetadata(_)));
@@ -667,7 +667,7 @@ mod tests {
         let atime = OffsetDateTime::UNIX_EPOCH + Duration::days(90);
         let mtime = OffsetDateTime::UNIX_EPOCH + Duration::days(60);
         let lookup = superblock
-            .setattr(&client, ino, Some(atime), Some(mtime))
+            .setattr(ino, Some(atime), Some(mtime))
             .await
             .expect("setattr should be successful");
         let stat = lookup.stat;
@@ -716,7 +716,7 @@ mod tests {
 
                 let file_name = "bar";
                 superblock
-                    .create(&client, ROOT_INODE_NO, file_name.as_ref(), InodeKind::File)
+                    .create(ROOT_INODE_NO, file_name.as_ref(), InodeKind::File)
                     .await
                     .unwrap();
 
