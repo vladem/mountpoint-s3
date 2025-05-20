@@ -38,7 +38,7 @@ use crate::fs::{CacheConfig, FUSE_ROOT_INODE};
 use crate::logging;
 #[cfg(feature = "manifest")]
 use crate::manifest::{Manifest, ManifestEntry, ManifestError};
-use crate::mountspace::Mountspace;
+use crate::mountspace::{Mountspace, MountspaceDirectoryReplier};
 use crate::prefix::Prefix;
 use crate::s3::S3Personality;
 use crate::sync::atomic::{AtomicU64, Ordering};
@@ -521,8 +521,8 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
         fh: u64,
         offset: i64,
         is_readdirplus: bool,
-        mut reply: Box<dyn DirectoryReplier>,
-    ) -> Result<(), InodeError> {
+        mut reply: MountspaceDirectoryReplier,
+    ) -> Result<(MountspaceDirectoryReplier), InodeError> {
         let dir_handle = {
             let dir_handles = self.inner.dir_handles.read().unwrap();
             dir_handles.get(&fh).cloned().ok_or(InodeError::NoSuchDirHandle)
@@ -568,7 +568,7 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
                             //readdir_handle.remember(&entry.lookup);
                         }
                     }
-                    return Ok(());
+                    return Ok(reply);
                 }
             }
             /* err!(
@@ -584,12 +584,12 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
         /// Wrap a replier to duplicate the entries and store them in `dir_handle.last_response` so
         /// we can re-use them if the directory handle rewinds
         struct Reply {
-            reply: Box<dyn DirectoryReplier>,
+            reply: MountspaceDirectoryReplier,
             entries: Vec<DirectoryEntry>,
         }
 
         impl Reply {
-            async fn finish(self, offset: i64, dir_handle: &DirHandle) -> Box<dyn DirectoryReplier> {
+            async fn finish(self, offset: i64, dir_handle: &DirHandle) -> MountspaceDirectoryReplier {
                 *dir_handle.last_response.lock().await = Some((offset, self.entries));
                 self.reply
             }
@@ -620,8 +620,7 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
                 lookup,
             };
             if reply.add(entry) {
-                reply.finish(offset, &dir_handle).await;
-                return Ok(());
+                return Ok(reply.finish(offset, &dir_handle).await);
             }
             dir_handle.next_offset();
         }
@@ -639,8 +638,7 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
                 lookup,
             };
             if reply.add(entry) {
-                reply.finish(offset, &dir_handle).await;
-                return Ok(());
+                return Ok(reply.finish(offset, &dir_handle).await);
             }
             dir_handle.next_offset();
         }
@@ -648,8 +646,7 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
         loop {
             let next = match self.read_next_from_handle(readdir_handle).await? {
                 None => {
-                    reply.finish(offset, &dir_handle).await;
-                    return Ok(());
+                    return Ok(reply.finish(offset, &dir_handle).await);
                 }
                 Some(next) => next,
             };

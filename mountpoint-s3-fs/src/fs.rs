@@ -9,6 +9,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tracing::{debug, trace, Level};
 
+use crate::mountspace::MountspaceDirectoryReplier;
 use fuser::consts::FOPEN_DIRECT_IO;
 use fuser::{FileAttr, KernelConfig};
 use mountpoint_s3_client::types::ChecksumAlgorithm;
@@ -591,8 +592,10 @@ where
             .handleNo
             .load(Ordering::Relaxed);
         let mut re: Box<(dyn DirectoryReplier)> = Box::new(reply);
-        self.superblock.readdir(parent, num, offset, false, &mut re).await;
-        Ok(re)
+        self.superblock
+            .readdir(parent, num, offset, false, MountspaceDirectoryReplier::new(re))
+            .await;
+        Ok(())
     }
 
     pub async fn readdirplus<R: DirectoryReplier>(
@@ -600,8 +603,8 @@ where
         parent: InodeNo,
         fh: u64,
         offset: i64,
-        reply: R,
-    ) -> Result<R, Error> {
+        reply: &R,
+    ) -> Result<(), Error> {
         trace!("fs:readdirplus with ino {:?} fh {:?} offset {:?}", parent, fh, offset);
         //self.readdir_impl(parent, fh, offset, true, reply).await
         let num = self
@@ -614,10 +617,10 @@ where
             .load(Ordering::Relaxed);
 
         self.superblock
-            .readdir(parent, num, offset, true, Box::new(reply))
+            .readdir(parent, num, offset, true, MountspaceDirectoryReplier::new(Box::new(re)))
             .await
             .map_err(|x| err!(libc::EINVAL,source: x, "error "));
-        Ok(reply)
+        Ok(())
     }
 
     pub async fn fsync(&self, _ino: InodeNo, fh: u64, _datasync: bool) -> Result<(), Error> {
