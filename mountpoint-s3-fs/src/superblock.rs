@@ -256,11 +256,12 @@ impl<OC: ObjectClient + Send + Sync> Superblock<OC> {
         let kind = looked_up.inode.kind();
 
         crate::mountspace::LookedUp {
-            bucket: self.inner.bucket.clone(),
+            bucket: Some(self.inner.bucket.clone()),
             ino: looked_up.inode.ino(),
             stat: looked_up.stat,
             kind,
             is_remote: looked_up.inode.is_remote().unwrap(),
+            full_key: self.inner.full_key_for_inode(&looked_up.inode),
         }
     }
 }
@@ -921,10 +922,6 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
         };
 
         Ok(())
-    }
-
-    fn full_key_for_inode(&self, inode: InodeNo) -> ValidKey {
-        self.inner.full_key_for_inode(&self.inner.get(inode).unwrap())
     }
 }
 

@@ -33,7 +33,8 @@ pub struct LookedUp {
     pub stat: InodeStat,
     pub kind: InodeKind,
     pub is_remote: bool,
-    pub bucket: String,
+    pub bucket: Option<String>,
+    pub full_key: ValidKey,
 }
 
 impl LookedUp {
@@ -84,6 +85,4 @@ pub trait Mountspace: Send + Sync + Debug {
     async fn rmdir(&self, parent_ino: InodeNo, name: &OsStr) -> Result<(), InodeError>;
 
     async fn unlink(&self, parent_ino: InodeNo, name: &OsStr) -> Result<(), InodeError>;
-
-    fn full_key_for_inode(&self, inode: InodeNo) -> ValidKey;
 }

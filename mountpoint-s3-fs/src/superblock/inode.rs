@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::time::{Duration, SystemTime};
 
+use crate::mountspace::Mountspace;
 use crate::prefix::Prefix;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -424,6 +425,7 @@ impl WriteMode {
 
 #[cfg(test)]
 mod tests {
+    use crate::mountspace::Mountspace;
     use crate::superblock::Superblock;
     use mountpoint_s3_client::{
         mock_client::{MockClient, MockClientConfig, MockObject},
@@ -517,7 +519,7 @@ mod tests {
 
         let lookup = superblock.lookup(ROOT_INODE_NO, name.as_ref()).await.unwrap();
         //let lookup_count = lookup.inode.inner.sync.read().unwrap().lookup_count;
-        //assert_eq!(lookup_count, 1);
+        //asmountpoint-s3-fs/tests/reftests/harness.rssert_eq!(lookup_count, 1);
         let ino = lookup.ino;
 
         superblock.forget(ino, 1);
