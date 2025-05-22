@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::time::{Duration, SystemTime};
 
-use crate::mountspace::Mountspace;
 use crate::prefix::Prefix;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -102,6 +101,12 @@ impl Inode {
             new_lookup_count = lookup_count,
             "decremented lookup count",
         );
+        *lookup_count
+    }
+
+    pub(super) fn read_lookup_count(&self) -> u64 {
+        let mut state = self.inner.sync.write().unwrap();
+        let lookup_count = &mut state.lookup_count;
         *lookup_count
     }
 
@@ -737,12 +742,13 @@ mod tests {
                     "test_bucket",
                     &Default::default(),
                     Default::default(),
+                    Default::default(),
                 ));
 
                 let lookup = superblock.lookup(ROOT_INODE_NO, name.as_ref()).await.unwrap();
-                let lookup_count = lookup.inode.inner.sync.read().unwrap().lookup_count;
+                let lookup_count = superblock.get_lookup_count(lookup.ino).unwrap();
                 assert_eq!(lookup_count, 1);
-                let ino = lookup.inode.ino();
+                let ino = lookup.ino;
 
                 let superblock_clone = superblock.clone();
                 let forget_task = thread::spawn(move || {
@@ -756,7 +762,9 @@ mod tests {
                     .unwrap();
 
                 forget_task.join().unwrap();
-                let lookup_count = lookup.inode.inner.sync.read().unwrap().lookup_count;
+                let lookup_count = superblock
+                    .get_lookup_count(lookup.ino)
+                    .expect("should be able to get lookup count");
                 assert_eq!(lookup_count, 0);
             }
 

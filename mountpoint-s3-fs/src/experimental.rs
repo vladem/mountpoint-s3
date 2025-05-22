@@ -42,6 +42,7 @@ pub struct HyperBlock {
 }
 
 impl HyperBlock {
+    #[allow(clippy::type_complexity)]
     pub fn new(channel_configs: Vec<(String, String, Vec<(String, String, usize)>)>) -> Self {
         let channel_count = channel_configs.len();
         let mut nodes = BTreeMap::new();
@@ -80,9 +81,8 @@ impl HyperBlock {
             };
 
             // Second pass: create all file nodes for this channel
-            //created_files = created_files + (files_with_etags.len() as u64);
-            for (_file_idx, (file, etag_str, size)) in files_with_etags.iter().enumerate() {
-                let file_inode = next_file_ino as u64;
+            for (file, etag_str, size) in files_with_etags.iter() {
+                let file_inode = next_file_ino;
 
                 // Add file to channel's children
                 channel_node.children.insert(file.clone(), file_inode);
@@ -166,23 +166,15 @@ impl HyperBlock {
 
     fn full_key_for_inode_explicit(&self, node: &HyperNode) -> ValidKey {
         if node.kind == InodeKind::Directory {
-            if node.ino == 1 {
-                // Root directory - return empty string
-                return ValidKey::root();
-            } else {
-                // For directories, we need a trailing slash
-                // Use ValidKey::new since we need to validate
-
-                return ValidKey::root();
-            }
+            ValidKey::root()
         } else {
             // For files, just return the filename directly
-            return ValidKey::root()
+            ValidKey::root()
                 .new_child(ValidName::parse_str(&node.name).unwrap(), InodeKind::File)
                 .unwrap_or_else(|_| {
                     // Fallback
                     ValidKey::root()
-                });
+                })
         }
     }
 }
@@ -215,10 +207,10 @@ impl Mountspace for HyperBlock {
         Ok(LookedUp {
             ino: child.ino,
             stat: child.stat.clone(),
-            kind: child.kind.clone(),
+            kind: child.kind,
             is_remote: true,
             bucket: child.bucket.clone(),
-            full_key: self.full_key_for_inode_explicit(&child),
+            full_key: self.full_key_for_inode_explicit(child),
         })
     }
 
@@ -229,10 +221,10 @@ impl Mountspace for HyperBlock {
         Ok(LookedUp {
             ino: node.ino,
             stat: node.stat.clone(),
-            kind: node.kind.clone(),
+            kind: node.kind,
             is_remote: false,
             bucket: node.bucket.clone(),
-            full_key: self.full_key_for_inode_explicit(&node),
+            full_key: self.full_key_for_inode_explicit(node),
         })
     }
 
@@ -329,7 +321,7 @@ impl Mountspace for HyperBlock {
                 kind: InodeKind::Directory,
                 is_remote: false,
                 bucket: dir.bucket.clone(),
-                full_key: self.full_key_for_inode_explicit(&dir),
+                full_key: self.full_key_for_inode_explicit(dir),
             };
             let attr = self.make_attr(&lookup);
 
@@ -360,7 +352,7 @@ impl Mountspace for HyperBlock {
                 kind: InodeKind::Directory,
                 is_remote: false,
                 bucket: None,
-                full_key: self.full_key_for_inode_explicit(&parent_node),
+                full_key: self.full_key_for_inode_explicit(parent_node),
             };
             let attr = self.make_attr(&lookup);
 
@@ -368,10 +360,10 @@ impl Mountspace for HyperBlock {
                 ino: parent_ino,
                 offset: 2, // Next entry will be at offset 2
                 name: "..".into(),
-                attr: attr, // Simplified attribute for testing
+                attr, // Simplified attribute for testing
                 generation: 0,
                 ttl: lookup.validity(),
-                lookup: lookup,
+                lookup,
             };
 
             if reply.add(entry) {
@@ -398,7 +390,7 @@ impl Mountspace for HyperBlock {
                 kind: child.kind,
                 is_remote: false,
                 bucket: child.bucket.clone(),
-                full_key: self.full_key_for_inode_explicit(&child),
+                full_key: self.full_key_for_inode_explicit(child),
             };
             let attr = self.make_attr(&lookup);
 
@@ -406,10 +398,10 @@ impl Mountspace for HyperBlock {
                 ino: child.ino,
                 offset: (idx as i64) + start_idx as i64 + 3, // +3 for "." and ".." entries
                 name: name.into(),
-                attr: attr, // Simplified attribute for testing
+                attr, // Simplified attribute for testing
                 generation: 0,
                 ttl: lookup.validity(),
-                lookup: lookup,
+                lookup,
             };
 
             // Return if the buffer is full, otherwise continue
