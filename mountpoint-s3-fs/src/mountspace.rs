@@ -57,9 +57,9 @@ pub trait Mountspace: Send + Sync + Debug {
         mtime: Option<OffsetDateTime>,
     ) -> Result<LookedUp, InodeError>;
 
-    fn forget(&self, ino: InodeNo, n: u64);
-
     async fn create(&self, dir: InodeNo, name: &OsStr, kind: InodeKind) -> Result<LookedUp, InodeError>;
+
+    fn forget(&self, ino: InodeNo, n: u64);
 
     async fn start_writing(&self, ino: InodeNo, mode: &WriteMode, is_truncate: bool) -> Result<(), InodeError>;
 

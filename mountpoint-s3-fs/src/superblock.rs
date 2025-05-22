@@ -730,7 +730,6 @@ impl<OC: ObjectClient + Send + Sync> Mountspace for Superblock<OC> {
             }
             if is_readdirplus {
                 self.inner.remember(&next.inode);
-                //self.remember_from_handle(readdir_handle, &self.into_lookedup_mountspace(next));
                 //readdir_handle.remember(&next);
             }
             dir_handle.next_offset();
