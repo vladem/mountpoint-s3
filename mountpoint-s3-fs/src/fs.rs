@@ -457,13 +457,14 @@ where
         } else {
             FileHandleState::new_read_handle(&lookup, self).await?
         };
+        let (bucket, key) = lookup.s3_location()?;
 
         let handle = FileHandle {
             ino,
-            full_key: lookup.full_key,
+            full_key: key.clone(),
             open_pid: pid,
             state: AsyncMutex::new(state),
-            bucket: lookup.bucket.unwrap(), // TODO: Better error handling
+            bucket: bucket.into(), // TODO: Better error handling
         };
         let fh = self.next_handle();
         debug!(fh, ino, "new file handle created");
