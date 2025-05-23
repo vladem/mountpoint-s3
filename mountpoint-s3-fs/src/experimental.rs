@@ -1,8 +1,8 @@
 use crate::fs::DirectoryEntry;
-use crate::mountspace::Location;
 use crate::mountspace::LookedUp;
 use crate::mountspace::Mountspace;
 use crate::mountspace::MountspaceDirectoryReplier;
+use crate::mountspace::S3Location;
 use crate::superblock::path::ValidKey;
 use crate::superblock::path::ValidName;
 use crate::superblock::InodeError;
@@ -210,13 +210,10 @@ impl Mountspace for HyperBlock {
             stat: child.stat.clone(),
             kind: child.kind,
             is_remote: true,
-            location: match &child.bucket {
-                Some(bucket) => Location::S3 {
-                    bucket: bucket.clone(),
-                    full_key: self.full_key_for_inode_explicit(child),
-                },
-                None => Location::Virtual,
-            },
+            location: child.bucket.as_ref().map(|bucket| S3Location {
+                bucket: bucket.clone(),
+                full_key: self.full_key_for_inode_explicit(child),
+            }),
         })
     }
 
@@ -229,13 +226,10 @@ impl Mountspace for HyperBlock {
             stat: node.stat.clone(),
             kind: node.kind,
             is_remote: false,
-            location: match &node.bucket {
-                Some(bucket) => Location::S3 {
-                    bucket: bucket.clone(),
-                    full_key: self.full_key_for_inode_explicit(node),
-                },
-                None => Location::Virtual,
-            },
+            location: node.bucket.as_ref().map(|bucket| S3Location {
+                bucket: bucket.clone(),
+                full_key: self.full_key_for_inode_explicit(node),
+            }),
         })
     }
 
@@ -331,13 +325,10 @@ impl Mountspace for HyperBlock {
                 stat: dir.stat.clone(),
                 kind: InodeKind::Directory,
                 is_remote: false,
-                location: match &dir.bucket {
-                    Some(bucket) => Location::S3 {
-                        bucket: bucket.clone(),
-                        full_key: self.full_key_for_inode_explicit(dir),
-                    },
-                    None => Location::Virtual,
-                },
+                location: dir.bucket.as_ref().map(|bucket| S3Location {
+                    bucket: bucket.clone(),
+                    full_key: self.full_key_for_inode_explicit(dir),
+                }),
             };
             let attr = self.make_attr(&lookup);
 
@@ -367,13 +358,10 @@ impl Mountspace for HyperBlock {
                 stat: parent_node.stat.clone(),
                 kind: InodeKind::Directory,
                 is_remote: false,
-                location: match &parent_node.bucket {
-                    Some(bucket) => Location::S3 {
-                        bucket: bucket.clone(),
-                        full_key: self.full_key_for_inode_explicit(parent_node),
-                    },
-                    None => Location::Virtual,
-                },
+                location: parent_node.bucket.as_ref().map(|bucket| S3Location {
+                    bucket: bucket.clone(),
+                    full_key: self.full_key_for_inode_explicit(parent_node),
+                }),
             };
             let attr = self.make_attr(&lookup);
 
@@ -410,13 +398,10 @@ impl Mountspace for HyperBlock {
                 stat: child.stat.clone(),
                 kind: child.kind,
                 is_remote: false,
-                location: match &child.bucket {
-                    Some(bucket) => Location::S3 {
-                        bucket: bucket.clone(),
-                        full_key: self.full_key_for_inode_explicit(child),
-                    },
-                    None => Location::Virtual,
-                },
+                location: child.bucket.as_ref().map(|bucket| S3Location {
+                    bucket: bucket.clone(),
+                    full_key: self.full_key_for_inode_explicit(child),
+                }),
             };
             let attr = self.make_attr(&lookup);
 

@@ -99,7 +99,7 @@ where
         let is_truncate = flags.contains(OpenFlags::O_TRUNC);
         let write_mode = fs.config.write_mode();
         fs.superblock.start_writing(ino, &write_mode, is_truncate).await?;
-        let (bucket, key) = lookup.s3_location()?;
+        let location = lookup.s3_location()?;
         let handle = if write_mode.incremental_upload {
             let initial_etag = if is_truncate {
                 None
@@ -108,8 +108,8 @@ where
             };
             let current_offset = if is_truncate { 0 } else { lookup.stat.size as u64 };
             let request = fs.uploader.start_incremental_upload(
-                bucket.to_string(),
-                key.clone().into(),
+                location.bucket.to_string(),
+                location.full_key.clone().into(),
                 current_offset,
                 initial_etag.clone(),
             );
@@ -121,7 +121,7 @@ where
         } else {
             let request = fs
                 .uploader
-                .start_atomic_upload(bucket.to_string(), key.as_ref().into())
+                .start_atomic_upload(location.bucket.to_string(), location.full_key.as_ref().into())
                 .map_err(|e| err!(libc::EIO, source:e, "put failed to start"))?;
             FileHandleState::Write(UploadState::MPUInProgress { request })
         };
@@ -140,14 +140,16 @@ where
             ));
         }
         fs.superblock.start_reading(lookup.ino).await?;
-        let (bucket, full_key) = lookup.s3_location()?;
+        let location = lookup.s3_location()?;
         let object_size = lookup.stat.size as u64;
         let etag = match &lookup.stat.etag {
             None => return Err(err!(libc::EBADF, "no E-Tag for inode {}", lookup.ino)),
             Some(etag) => ETag::from_str(etag).expect("E-Tag should be set"),
         };
-        let object_id = ObjectId::new(full_key.to_string(), etag);
-        let request = fs.prefetcher.prefetch(bucket.to_string(), object_id, object_size);
+        let object_id = ObjectId::new(location.full_key.to_string(), etag);
+        let request = fs
+            .prefetcher
+            .prefetch(location.bucket.to_string(), object_id, object_size);
         let handle = FileHandleState::Read(request);
         metrics::gauge!("fs.current_handles", "type" => "read").increment(1.0);
         Ok(handle)
