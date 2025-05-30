@@ -71,6 +71,7 @@ impl HyperBlock {
                 stat: InodeStat::for_directory(self.mount_time, NEVER_EXPIRE_TTL),
                 kind: InodeKind::Directory,
                 is_remote: true,
+                // TODO: is it required for directories? or only used on 'open' for files?
                 location: Some(S3Location {
                     bucket: self.bucket_name.clone(),
                     full_key: full_key.try_into().expect("must be a valid key"),
@@ -237,7 +238,7 @@ impl Mountspace for HyperBlock {
         _is_readdirplus: bool,
         mut reply: MountspaceDirectoryReplier<'a>,
     ) -> Result<MountspaceDirectoryReplier<'a>, InodeError> {
-        // DirectoryEntry::lookup is not used, but have to be supplied, so define a dummy value
+        // DirectoryEntry::lookup is not used, but have to be supplied, so define a dummy value (TODO: remove from [DirectoryEntry]?)
         let dummy_lookup = LookedUp {
             ino: FUSE_ROOT_INODE,
             stat: InodeStat::for_directory(self.mount_time, NEVER_EXPIRE_TTL),
