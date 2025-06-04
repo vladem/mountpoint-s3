@@ -170,11 +170,14 @@ where
         };
 
         let superblock: Arc<dyn Mountspace> = if let Some(manifest) = config.manifest.as_ref() {
-            // TODO: respect prefix argument
+            let channels = vec![crate::experimental::ChannelConfig {
+                bucket_name: bucket.to_string(),
+                prefix: prefix.clone(),
+            }];
             Arc::new(crate::experimental::HyperBlock::new(
                 make_attr_config,
-                bucket,
                 manifest.clone(),
+                channels,
             ))
         } else {
             Arc::new(Superblock::new(

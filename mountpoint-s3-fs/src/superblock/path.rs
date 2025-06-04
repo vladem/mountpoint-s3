@@ -116,17 +116,15 @@ impl From<ValidKey> for String {
     }
 }
 
-// TODO: does it have to end with "/" for directories?
-impl TryFrom<String> for ValidKey {
-    type Error = ValidKeyError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
+// TODO: TryFrom, performing validations
+impl From<String> for ValidKey {
+    fn from(value: String) -> Self {
         let name_len = value.rsplit("/").next().expect("at least one component").len();
         let name_offset = value.len() - name_len;
-        Ok(Self {
+        Self {
             key: value.into(),
             name_offset,
-        })
+        }
     }
 }
 

@@ -4,11 +4,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, Default)]
 pub struct DbEntry {
     #[serde(skip)]
     pub id: u64,
-    pub full_key: String, // Both files and directories don't have '/' in the end
+    /// S3 key of the object.
+    ///
+    /// When a bucket prefix is mounted, this field does not contain prefix when stored or loaded from the DB.
+    /// Both files and directories don't have '/' in the end.
+    pub full_key: String,
     #[serde(skip)]
     pub name_offset: Option<u64>,
     #[serde(skip)]
@@ -153,5 +157,27 @@ impl Db {
         }
         drop(stmt);
         tx.commit()
+    }
+
+    pub fn delete_shadowed(&self) -> Result<()> {
+        // Shadowed file and shadowing directory will have the same key.
+        // Delete shadowed files based on the fact that files guaranteed to contain `etag` and `size`.
+        let conn = self.conn.lock().expect("lock must succeed");
+        conn.execute(
+            "
+                DELETE FROM s3_objects
+                WHERE key IN (
+                    SELECT key
+                    FROM s3_objects
+                    GROUP BY key
+                    HAVING COUNT(*) > 1
+                )
+                AND etag IS NOT NULL
+                AND size IS NOT NULL
+            ",
+            (),
+        )?;
+
+        Ok(())
     }
 }

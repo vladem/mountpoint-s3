@@ -1,5 +1,5 @@
 use crate::common::fuse::{self, read_dir_to_entry_names, TestClient, TestSessionConfig};
-use crate::common::manifest::{create_dummy_manifest, create_manifest, insert_entries};
+use crate::common::manifest::{create_dummy_manifest, create_manifest, insert_entries, DUMMY_SIZE};
 #[cfg(feature = "s3_tests")]
 use crate::common::s3::{get_test_bucket_and_prefix, get_test_region, get_test_sdk_client};
 use mountpoint_s3_fs::manifest::{DbEntry, Manifest};
@@ -73,7 +73,18 @@ fn test_readdir_manifest_missing_metadata(etag: Option<&str>, size: Option<usize
     let key = "key";
     let (_tmp_dir, db_path) = create_dummy_manifest::<&str>(&[], 0).expect("manifest must be created");
     let test_session = fuse::mock_session::new("", manifest_test_session_config(&db_path));
-    insert_entries(&db_path, &[(key, "", etag, size)]).expect("insert invalid row must succeed");
+    insert_entries(
+        &db_path,
+        &[DbEntry {
+            id: 2,
+            full_key: key.to_string(),
+            name_offset: Some(0),
+            parent_id: Some(1),
+            etag: etag.map(String::from),
+            size,
+        }],
+    )
+    .expect("insert invalid row must succeed");
 
     let mut read_dir_iter = fs::read_dir(test_session.mount_path()).unwrap();
     let e = read_dir_iter
@@ -112,7 +123,18 @@ fn test_lookup_manifest_missing_metadata(etag: Option<&str>, size: Option<usize>
     let key = "key";
     let (_tmp_dir, db_path) = create_dummy_manifest::<&str>(&[], 0).expect("manifest must be created");
     let test_session = fuse::mock_session::new("", manifest_test_session_config(&db_path));
-    insert_entries(&db_path, &[(key, "", etag, size)]).expect("insert invalid row must succeed");
+    insert_entries(
+        &db_path,
+        &[DbEntry {
+            id: 2,
+            full_key: key.to_string(),
+            name_offset: Some(0),
+            parent_id: Some(1),
+            etag: etag.map(String::from),
+            size,
+        }],
+    )
+    .expect("insert invalid row must succeed");
 
     let e = metadata(test_session.mount_path().join(key)).expect_err("lookup must fail");
     assert_eq!(e.raw_os_error().expect("lookup must fail"), libc::EIO);
@@ -146,9 +168,11 @@ async fn test_basic_read_manifest_s3(readdir_before_read: bool, stat_before_read
             full_key: format!("{}{}", prefix, visible_object.0),
             etag: Some(visible_object_etag),
             size: Some(visible_object.1.len()),
+            ..Default::default()
         })]
         .into_iter(),
         1000,
+        &prefix,
     )
     .expect("manifest must be created");
     let test_session =
@@ -216,9 +240,11 @@ async fn test_read_manifest_wrong_metadata(wrong_etag: bool, wrong_size: bool, e
                 Some(object_etag)
             },
             size: if wrong_size { Some(2048) } else { Some(object.1.len()) }, // size smaller than actual will result in incomplete response
+            ..Default::default()
         })]
         .into_iter(),
         1000,
+        &prefix,
     )
     .expect("manifest must be created");
     let test_session =
@@ -231,6 +257,57 @@ async fn test_read_manifest_wrong_metadata(wrong_etag: bool, wrong_size: bool, e
     let mut read_buffer = Default::default();
     let e = fh.read_to_end(&mut read_buffer).expect_err("read must fail");
     assert_eq!(e.raw_os_error().expect("read must fail"), errno);
+}
+
+#[test_case(&[
+    "dir1", // must be shadowed
+    "dir1/a.txt",
+    "dir2/b.txt",
+], "dir1", true; "lookup, shadowed first")]
+#[test_case(&[
+    "dir1/a.txt",
+    "dir2/b.txt",
+    "dir1", // must be shadowed
+], "dir1", true; "lookup, shadowing first")]
+#[test_case(&[
+    "dir1", // must be shadowed
+    "dir1/a.txt",
+    "dir2/b.txt",
+], "dir1", false; "readdir, shadowed first")]
+#[test_case(&[
+    "dir1/a.txt",
+    "dir2/b.txt",
+    "dir1", // must be shadowed
+], "dir1", false; "readdir, shadowing first")]
+fn test_shadowed(manifest_keys: &[&str], shadowed: &str, lookup: bool) {
+    let (_tmp_dir, db_path) = create_dummy_manifest(manifest_keys, DUMMY_SIZE).expect("manifest must be created");
+    let test_session = fuse::mock_session::new("", manifest_test_session_config(&db_path));
+
+    if lookup {
+        // test with lookup
+        let m = metadata(test_session.mount_path().join(shadowed)).unwrap();
+        assert!(m.file_type().is_dir(), "shadowed must be a dir");
+    } else {
+        // test with readdir (listing parent directory of the shadowed file)
+        let shadowed_name = shadowed.rsplit("/").next().unwrap();
+        let parent_dir = &shadowed[0..shadowed.len() - shadowed_name.len()];
+        let mut read_dir_iter = fs::read_dir(test_session.mount_path().join(parent_dir)).unwrap();
+        let entry = read_dir_iter
+            .find(|entry| {
+                entry
+                    .as_ref()
+                    .expect("readdir must succeed")
+                    .file_name()
+                    .to_string_lossy()
+                    == shadowed_name
+            })
+            .expect("must find the shadowing directory")
+            .expect("readdir must succeed");
+        assert!(
+            entry.file_type().expect("must get file type").is_dir(),
+            "shadowed must be a dir"
+        );
+    }
 }
 
 fn manifest_test_session_config(db_path: &Path) -> TestSessionConfig {

@@ -14,6 +14,7 @@ pub fn create_db(
     db_path: &Path,
     entries: impl Iterator<Item = Result<DbEntry, ManifestError>>,
     batch_size: usize,
+    prefix: &str,
 ) -> Result<(), ManifestError> {
     let db = Db::new(db_path)?;
     db.create_table()?;
@@ -25,6 +26,10 @@ pub fn create_db(
         // parse next entry and validate it
         let mut entry = entry?;
         validate_db_entry(&entry)?;
+        // remove prefix if specified and present in the entry
+        if !prefix.is_empty() && entry.full_key.starts_with(prefix) {
+            entry.full_key.drain(0..prefix.len());
+        }
         // split full_key to parent_dir and file_name
         let parent_dir = entry.full_key.rsplit_once('/').map(|(dir, _)| dir);
         // insert the parent directory and link current entry to it
@@ -46,19 +51,26 @@ pub fn create_db(
         db.insert_batch(&buffer)?;
     }
 
+    db.delete_shadowed()?;
+
     db.create_index()?;
 
     Ok(())
 }
 
-/// Ingests a manifest into the database
-pub fn ingest_manifest(csv_path: &Path, db_path: &Path) -> Result<(), ManifestError> {
+/// Ingests a manifest into the database.
+///
+/// The expected file format is CSV with no header and 3 columns -- full_key, etag, size.
+/// The field `full_key` may not contain S3 prefix, when this prefix is mounted. It's not an error if prefix is present.
+/// The field `etag` may contain enclosing quotes, just as it is returned by S3 ListObjectsV2 API.
+/// All fields must be properly escaped.
+pub fn ingest_manifest(csv_path: &Path, db_path: &Path, prefix: &str) -> Result<(), ManifestError> {
     let file = File::open(csv_path).map_err(|err| ManifestError::CsvOpenError(csv_path.to_path_buf(), err))?;
     let csv_reader = CsvReader::new(BufReader::new(file));
     if db_path.exists() {
         return Err(ManifestError::DbExists);
     }
-    create_db(db_path, csv_reader, 100000)?;
+    create_db(db_path, csv_reader, 100000, prefix)?;
     Ok(())
 }
 
