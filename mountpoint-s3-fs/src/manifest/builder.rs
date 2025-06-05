@@ -4,10 +4,10 @@ use std::{collections::HashMap, fs::File};
 
 use fuser::FUSE_ROOT_ID;
 
+use crate::superblock::path::{ValidKey, ValidKeyError};
 use crate::{
     manifest::db::{Db, DbEntry},
     manifest::{CsvReader, ManifestError},
-    superblock::path::ValidName,
 };
 
 pub fn create_db(
@@ -78,11 +78,10 @@ fn validate_db_entry(db_entry: &DbEntry) -> Result<(), ManifestError> {
     if db_entry.etag.is_none() || db_entry.size.is_none() {
         return Err(ManifestError::NoEtagOrSize(db_entry.full_key.clone()));
     }
-    for component in db_entry.full_key.split('/') {
-        if ValidName::parse_str(component).is_err() {
-            return Err(ManifestError::InvalidKey(db_entry.full_key.clone()));
-        }
+    if db_entry.full_key.ends_with('/') || db_entry.full_key.is_empty() {
+        Err(ValidKeyError::InvalidKey(db_entry.full_key.clone()))?
     }
+    ValidKey::validate(&db_entry.full_key)?;
     Ok(())
 }
 

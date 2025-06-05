@@ -134,7 +134,7 @@ impl Db {
     pub fn create_index(&self) -> Result<()> {
         let conn = self.conn.lock().expect("lock must succeed");
 
-        conn.execute("CREATE INDEX idx_parent_id ON s3_objects (parent_id, name)", ())?;
+        conn.execute("CREATE UNIQUE INDEX idx_parent_id ON s3_objects (parent_id, name)", ())?;
 
         Ok(())
     }
