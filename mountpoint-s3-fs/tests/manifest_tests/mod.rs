@@ -2,40 +2,6 @@ use crate::common::manifest::{create_dummy_manifest, DUMMY_SIZE};
 use mountpoint_s3_fs::manifest::ManifestError;
 use test_case::test_case;
 
-// TODO: move this test to fuse tests
-/*
-#[test_case(&[
-    "dir1/a.txt",
-    "dir1/dir2/b.txt",
-    "dir1/dir2/c.txt",
-    "dir1/dir3/dir4/d.txt",
-    "e.txt",
-]; "simple")]
-#[test_case(&[
-    "dir1/dir2/b.txt",
-    "dir1/a.txt",
-    "e.txt",
-    "dir1/dir3/dir4/d.txt",
-    "dir1/dir2/c.txt",
-]; "unsorted")]
-fn test_ingest_directories(manifest_keys: &[&str]) {
-    let all_expected_entries = &[
-        TestDbEntry::directory("dir1", ""),
-        TestDbEntry::file("dir1/a.txt", "dir1", DUMMY_ETAG, DUMMY_SIZE),
-        TestDbEntry::directory("dir1/dir2", "dir1"),
-        TestDbEntry::file("dir1/dir2/b.txt", "dir1/dir2", DUMMY_ETAG, DUMMY_SIZE),
-        TestDbEntry::file("dir1/dir2/c.txt", "dir1/dir2", DUMMY_ETAG, DUMMY_SIZE),
-        TestDbEntry::directory("dir1/dir3", "dir1"),
-        TestDbEntry::directory("dir1/dir3/dir4", "dir1/dir3"),
-        TestDbEntry::file("dir1/dir3/dir4/d.txt", "dir1/dir3/dir4", DUMMY_ETAG, DUMMY_SIZE),
-        TestDbEntry::file("e.txt", "", DUMMY_ETAG, DUMMY_SIZE),
-    ];
-    let (_tmp_dir, db_path) = create_dummy_manifest(manifest_keys, DUMMY_SIZE).expect("manifest must be created");
-    let db_entries = select_all(&db_path).expect("must select all objects");
-    assert_eq!(&db_entries, all_expected_entries);
-}
-*/
-
 #[test_case("dir1/./a.txt"; "with dot")]
 #[test_case("dir1/../a.txt"; "with 2 dots")]
 #[test_case("dir1//a.txt"; "with 2 slashes")]

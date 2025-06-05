@@ -4,6 +4,8 @@ use crate::common::manifest::{create_dummy_manifest, create_manifest, insert_ent
 use crate::common::s3::{get_test_bucket_and_prefix, get_test_region, get_test_sdk_client};
 use mountpoint_s3_fs::manifest::{DbEntry, Manifest};
 use mountpoint_s3_fs::S3FilesystemConfig;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 use std::fs::{self, metadata};
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
@@ -11,6 +13,7 @@ use std::path::Path;
 #[cfg(feature = "s3_tests")]
 use std::{fs::File, io::Read};
 use test_case::test_case;
+use walkdir::WalkDir;
 
 #[test_case(&[
     "dir1/a.txt",
@@ -307,6 +310,54 @@ fn test_shadowed(manifest_keys: &[&str], shadowed: &str, lookup: bool) {
             entry.file_type().expect("must get file type").is_dir(),
             "shadowed must be a dir"
         );
+    }
+}
+
+#[test_case(false, false; "readdir, unsorted")]
+#[test_case(false, true; "readdir, sorted")]
+#[test_case(true, false; "lookup, unsorted")]
+#[test_case(true, true; "lookup, sorted")]
+fn test_unsorted_manifest(lookup: bool, sorted: bool) {
+    let manifest_keys_sorted = vec![
+        "dir1/a.txt",
+        "dir1/dir2/b.txt",
+        "dir1/dir2/c.txt",
+        "dir1/dir3/dir4/d.txt",
+        "e.txt",
+    ];
+    let mut manifest_keys = manifest_keys_sorted.clone();
+    if !sorted {
+        let mut rng = thread_rng();
+        manifest_keys.shuffle(&mut rng);
+    }
+    let (_tmp_dir, db_path) = create_dummy_manifest(&manifest_keys, 0).expect("manifest must be created");
+    let test_session = fuse::mock_session::new("", manifest_test_session_config(&db_path));
+    if lookup {
+        for key in manifest_keys {
+            let m = metadata(test_session.mount_path().join(key)).unwrap();
+            assert!(m.file_type().is_file(), "must be a file: {}", key);
+        }
+    } else {
+        let readdir_files: Vec<_> = WalkDir::new(test_session.mount_path())
+            .sort_by_file_name()
+            .into_iter()
+            .filter_map(|dir_entry| {
+                let dir_entry = dir_entry.expect("readdir must succeed").into_path();
+                if dir_entry.is_file() {
+                    let mount_path = test_session.mount_path().to_str().unwrap();
+                    let full_path = dir_entry
+                        .to_str()
+                        .unwrap()
+                        .strip_prefix(mount_path)
+                        .unwrap()
+                        .trim_start_matches("/");
+                    Some(full_path.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(readdir_files, manifest_keys_sorted);
     }
 }
 
