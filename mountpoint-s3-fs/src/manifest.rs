@@ -29,6 +29,8 @@ pub enum ManifestError {
     NoEtagOrSize(String),
     #[error("key is invalid")]
     InvalidKey(#[from] ValidKeyError),
+    #[error("folder marker {0}")]
+    FolderMarker(String),
     #[error("invalid database row")]
     InvalidRow,
     #[error("csv error")]

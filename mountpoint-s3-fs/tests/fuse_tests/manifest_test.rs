@@ -313,19 +313,28 @@ fn test_shadowed(manifest_keys: &[&str], shadowed: &str, lookup: bool) {
     }
 }
 
-#[test_case(false, false; "readdir, unsorted")]
-#[test_case(false, true; "readdir, sorted")]
-#[test_case(true, false; "lookup, unsorted")]
-#[test_case(true, true; "lookup, sorted")]
-fn test_unsorted_manifest(lookup: bool, sorted: bool) {
-    let manifest_keys_sorted = vec![
+#[test_case(false, false, false; "readdir, unsorted")]
+#[test_case(false, true, false; "readdir, sorted")]
+#[test_case(true, false, false; "lookup, unsorted")]
+#[test_case(true, true, false; "lookup, sorted")]
+#[test_case(false, true, true; "readdir, sorted, with folder marker")]
+#[test_case(true, true, true; "lookup, sorted, with folder marker")]
+#[test_case(false, false, true; "readdir, unsorted, with folder marker")]
+#[test_case(true, false, true; "lookup, unsorted, with folder marker")]
+fn test_unsorted_manifest(lookup: bool, sorted: bool, with_folder_marker: bool) {
+    let all_files_sorted = vec![
         "dir1/a.txt",
         "dir1/dir2/b.txt",
         "dir1/dir2/c.txt",
         "dir1/dir3/dir4/d.txt",
         "e.txt",
     ];
-    let mut manifest_keys = manifest_keys_sorted.clone();
+    let mut manifest_keys = if with_folder_marker {
+        vec!["dir1/"] // folder marker
+    } else {
+        Default::default()
+    };
+    manifest_keys.extend_from_slice(&all_files_sorted);
     if !sorted {
         let mut rng = thread_rng();
         manifest_keys.shuffle(&mut rng);
@@ -333,7 +342,7 @@ fn test_unsorted_manifest(lookup: bool, sorted: bool) {
     let (_tmp_dir, db_path) = create_dummy_manifest(&manifest_keys, 0).expect("manifest must be created");
     let test_session = fuse::mock_session::new("", manifest_test_session_config(&db_path));
     if lookup {
-        for key in manifest_keys {
+        for key in all_files_sorted {
             let m = metadata(test_session.mount_path().join(key)).unwrap();
             assert!(m.file_type().is_file(), "must be a file: {}", key);
         }
@@ -357,7 +366,7 @@ fn test_unsorted_manifest(lookup: bool, sorted: bool) {
                 }
             })
             .collect();
-        assert_eq!(readdir_files, manifest_keys_sorted);
+        assert_eq!(readdir_files, all_files_sorted);
     }
 }
 

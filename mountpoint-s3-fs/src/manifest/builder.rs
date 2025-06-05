@@ -25,8 +25,15 @@ pub fn create_db(
     for entry in entries {
         // parse next entry and validate it
         let mut entry = entry?;
-        validate_db_entry(&entry)?;
-        // remove prefix if specified and present in the entry
+        match validate_db_entry(&entry, prefix) {
+            Err(ManifestError::FolderMarker(key)) => {
+                tracing::warn!("folder marker will be ignored: {}", key);
+                continue;
+            }
+            Err(err) => return Err(err),
+            _ => (),
+        }
+        // remove prefix if specified
         if !prefix.is_empty() && entry.full_key.starts_with(prefix) {
             entry.full_key.drain(0..prefix.len());
         }
@@ -61,7 +68,7 @@ pub fn create_db(
 /// Ingests a manifest into the database.
 ///
 /// The expected file format is CSV with no header and 3 columns -- full_key, etag, size.
-/// The field `full_key` may not contain S3 prefix, when this prefix is mounted. It's not an error if prefix is present.
+/// The field `full_key` must contain S3 prefix, when the prefix is mounted.
 /// The field `etag` may contain enclosing quotes, just as it is returned by S3 ListObjectsV2 API.
 /// All fields must be properly escaped.
 pub fn ingest_manifest(csv_path: &Path, db_path: &Path, prefix: &str) -> Result<(), ManifestError> {
@@ -74,11 +81,17 @@ pub fn ingest_manifest(csv_path: &Path, db_path: &Path, prefix: &str) -> Result<
     Ok(())
 }
 
-fn validate_db_entry(db_entry: &DbEntry) -> Result<(), ManifestError> {
+fn validate_db_entry(db_entry: &DbEntry, prefix: &str) -> Result<(), ManifestError> {
     if db_entry.etag.is_none() || db_entry.size.is_none() {
         return Err(ManifestError::NoEtagOrSize(db_entry.full_key.clone()));
     }
-    if db_entry.full_key.ends_with('/') || db_entry.full_key.is_empty() {
+    if !db_entry.full_key.starts_with(prefix) {
+        Err(ValidKeyError::InvalidKey(db_entry.full_key.clone()))?
+    }
+    if db_entry.full_key.ends_with('/') {
+        return Err(ManifestError::FolderMarker(db_entry.full_key.clone()));
+    }
+    if db_entry.full_key.is_empty() {
         Err(ValidKeyError::InvalidKey(db_entry.full_key.clone()))?
     }
     ValidKey::validate(&db_entry.full_key)?;
@@ -128,4 +141,59 @@ fn ensure_dirs_inserted(
     }
 
     Ok(parent_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    const DUMMY_ETAG: &str = "\"3bebe4037c8f040e0e573e191d34b2c6\"";
+    const DUMMY_SIZE: usize = 1024;
+
+    #[test_case("dir1/./a.txt"; "with dot")]
+    #[test_case("dir1/../a.txt"; "with 2 dots")]
+    #[test_case("dir1//a.txt"; "with 2 slashes")]
+    #[test_case(""; "empty")]
+    #[test_case("dir1/a\0.txt"; "with 0")]
+    fn test_ingest_invalid_key(key: &str) {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("s3_keys.db3");
+        let err = create_db(
+            &db_path,
+            [Ok(DbEntry {
+                full_key: key.to_string(),
+                etag: Some(DUMMY_ETAG.to_string()),
+                size: Some(DUMMY_SIZE),
+                ..Default::default()
+            })]
+            .into_iter(),
+            1000,
+            "",
+        )
+        .expect_err("must be an error");
+        assert!(matches!(err, ManifestError::InvalidKey(_)));
+    }
+
+    #[test]
+    fn test_ingest_unprefixed_key() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("s3_keys.db3");
+        let prefix = "dir1/dir2/";
+        let bad_key = "a.txt";
+        let err = create_db(
+            &db_path,
+            [Ok(DbEntry {
+                full_key: bad_key.to_string(),
+                etag: Some(DUMMY_ETAG.to_string()),
+                size: Some(DUMMY_SIZE),
+                ..Default::default()
+            })]
+            .into_iter(),
+            1000,
+            prefix,
+        )
+        .expect_err("must be an error");
+        assert!(matches!(err, ManifestError::InvalidKey(_)));
+    }
 }
