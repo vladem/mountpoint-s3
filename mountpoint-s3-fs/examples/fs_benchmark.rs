@@ -9,7 +9,7 @@ use mountpoint_s3_client::config::{EndpointConfig, RustLogAdapter, S3ClientConfi
 use mountpoint_s3_client::S3CrtClient;
 use mountpoint_s3_fs::fuse::S3FuseFilesystem;
 use mountpoint_s3_fs::prefetch::Prefetcher;
-use mountpoint_s3_fs::{Runtime, S3Filesystem, S3FilesystemConfig};
+use mountpoint_s3_fs::{Runtime, S3Filesystem, S3FilesystemConfig, Superblock, SuperblockConfig};
 use tempfile::tempdir;
 use tracing_subscriber::fmt::Subscriber;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -161,14 +161,22 @@ fn mount_file_system(
         mountpoint.to_str().unwrap()
     );
     let prefetcher_builder = Prefetcher::default_builder(client.clone());
-    let fs = S3Filesystem::new(
-        client,
-        prefetcher_builder,
-        runtime,
+    let superblock = Box::new(Superblock::new(
+        client.clone(),
         bucket_name,
         &Default::default(),
-        filesystem_config,
-    );
+        SuperblockConfig {
+            cache_config: filesystem_config.cache_config.clone(),
+            s3_personality: filesystem_config.s3_personality,
+        },
+        mountpoint_s3_fs::MakeAttrConfig {
+            uid: filesystem_config.uid,
+            gid: filesystem_config.gid,
+            file_mode: filesystem_config.file_mode,
+            dir_mode: filesystem_config.dir_mode,
+        },
+    ));
+    let fs = S3Filesystem::new(client, prefetcher_builder, runtime, superblock, filesystem_config);
     let session = Session::new(S3FuseFilesystem::new(fs, None), mountpoint, &options)
         .expect("Should have created FUSE session successfully");
 
