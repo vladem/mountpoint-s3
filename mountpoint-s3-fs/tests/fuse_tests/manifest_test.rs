@@ -233,29 +233,46 @@ fn test_lookup_manifest_missing_metadata(etag: Option<&str>, size: Option<usize>
 }
 
 #[cfg(feature = "s3_tests")]
-#[test_case(false, false; "just read")]
-#[test_case(true, false; "readdir then read")]
-#[test_case(false, true; "stat then read")]
+#[test_case(false, false, true; "just read")]
+#[test_case(true, false, true; "readdir then read")]
+#[test_case(false, true, true; "stat then read")]
+#[test_case(false, false, false; "just read, no prefix")]
 #[tokio::test]
-async fn test_basic_read_manifest_s3(readdir_before_read: bool, stat_before_read: bool) {
-    let visible_object = ("visible_object_key", vec![b'1'; 1024]);
-    let invisible_object = ("invisible_object_key", vec![b'2'; 1024]);
+async fn test_basic_read_manifest_s3(readdir_before_read: bool, stat_before_read: bool, with_prefix: bool) {
+    use rand::RngCore;
+    use rand_chacha::rand_core::OsRng;
+
+    // Generate random names for objects
+    let random_suffix = OsRng.next_u64();
+    let visible_object_name = format!("visible_object_key_{}", random_suffix);
+    let invisible_object_name = format!("invisible_object_key_{}", random_suffix);
+
+    let visible_object = (visible_object_name, vec![b'1'; 1024]);
+    let invisible_object = (invisible_object_name, vec![b'2'; 1024]);
 
     // put objects
     let (bucket, prefix) = get_test_bucket_and_prefix("test_basic_read_manifest_s3");
+    let prefix = if with_prefix { prefix } else { String::new() };
     let sdk_client = get_test_sdk_client(&get_test_region()).await;
     let visible_object_etag = put_object(
         &sdk_client,
         &bucket,
         &prefix,
-        visible_object.0,
+        visible_object.0.as_str(),
         visible_object.1.clone(),
     )
     .await;
-    put_object(&sdk_client, &bucket, &prefix, invisible_object.0, invisible_object.1).await;
+    put_object(
+        &sdk_client,
+        &bucket,
+        &prefix,
+        invisible_object.0.as_str(),
+        invisible_object.1.clone(),
+    )
+    .await;
 
     let entries = [Ok(DbEntry {
-        full_key: visible_object.0.to_string(), // key does not contain the prefix
+        full_key: visible_object.0.clone(), // key does not contain the prefix
         etag: Some(visible_object_etag),
         size: Some(visible_object.1.len()),
         ..Default::default()
@@ -281,13 +298,13 @@ async fn test_basic_read_manifest_s3(readdir_before_read: bool, stat_before_read
         let dir_entry_names = read_dir_to_entry_names(read_dir_iter);
         assert_eq!(
             &dir_entry_names,
-            &["visible_object_key".to_string()],
-            "dir must contain file named visible_object_key"
+            &[visible_object.0.clone()],
+            "dir must contain file with the expected name"
         );
     }
     // if configured so, stat before read
     if stat_before_read {
-        let m = metadata(channel_dir.join("visible_object_key")).unwrap();
+        let m = metadata(channel_dir.join(&visible_object.0)).unwrap();
         assert!(m.file_type().is_file());
         assert_eq!(m.size(), visible_object.1.len() as u64);
     }
@@ -295,7 +312,7 @@ async fn test_basic_read_manifest_s3(readdir_before_read: bool, stat_before_read
     // Read file once
     let mut fh1 = File::options()
         .read(true)
-        .open(channel_dir.join(visible_object.0))
+        .open(channel_dir.join(&visible_object.0))
         .unwrap();
     let mut read_buffer = Default::default();
     fh1.read_to_end(&mut read_buffer).unwrap();
@@ -304,7 +321,7 @@ async fn test_basic_read_manifest_s3(readdir_before_read: bool, stat_before_read
     // We can read from a file more than once at the same time.
     let mut fh2 = File::options()
         .read(true)
-        .open(channel_dir.join(visible_object.0))
+        .open(channel_dir.join(&visible_object.0))
         .unwrap();
     read_buffer.clear();
     fh2.read_to_end(&mut read_buffer).unwrap();
@@ -313,8 +330,8 @@ async fn test_basic_read_manifest_s3(readdir_before_read: bool, stat_before_read
     // File missing in the manifest must not exist
     let e = File::options()
         .read(true)
-        .open(channel_dir.join(invisible_object.0))
-        .expect_err("invisible_object_key must not exist");
+        .open(channel_dir.join(&invisible_object.0))
+        .expect_err("invisible object must not exist");
     assert_eq!(e.kind(), ErrorKind::NotFound);
 }
 
