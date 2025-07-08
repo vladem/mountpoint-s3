@@ -21,9 +21,7 @@ use crate::mem_limiter::MemoryLimiter;
 use crate::mountspace::LookedUp;
 use crate::mountspace::Mountspace;
 use crate::prefetch::{Prefetcher, PrefetcherBuilder};
-use crate::prefix::Prefix;
-use crate::superblock::MakeAttrConfig;
-use crate::superblock::{InodeError, InodeKind, Superblock, SuperblockConfig};
+use crate::superblock::{InodeError, InodeKind};
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, AsyncMutex, AsyncRwLock};
 use crate::upload::Uploader;
@@ -152,51 +150,10 @@ where
         client: Client,
         prefetch_builder: PrefetcherBuilder<Client>,
         runtime: Runtime,
-        bucket: &str,
-        prefix: &Prefix,
+        mountspace: Box<dyn Mountspace>,
         config: S3FilesystemConfig,
     ) -> Self {
-        trace!(?bucket, ?prefix, ?config, "new filesystem");
-
-        let superblock_config = SuperblockConfig {
-            cache_config: config.cache_config.clone(),
-            s3_personality: config.s3_personality,
-        };
-        let make_attr_config = MakeAttrConfig {
-            uid: config.uid,
-            gid: config.gid,
-            file_mode: config.file_mode,
-            dir_mode: config.dir_mode,
-        };
-
-        #[cfg(feature = "manifest")]
-        let superblock: Arc<dyn Mountspace> = if let Some(manifest) = config.manifest.as_ref() {
-            let channels = vec![crate::manifest::ChannelConfig {
-                bucket_name: bucket.to_string(),
-                prefix: prefix.clone(),
-            }];
-            Arc::new(crate::manifest::HyperBlock::new(
-                make_attr_config,
-                manifest.clone(),
-                channels,
-            ))
-        } else {
-            Arc::new(Superblock::new(
-                client.clone(),
-                bucket,
-                prefix,
-                superblock_config,
-                make_attr_config,
-            ))
-        };
-        #[cfg(not(feature = "manifest"))]
-        let superblock = Arc::new(Superblock::new(
-            client.clone(),
-            bucket,
-            prefix,
-            superblock_config,
-            make_attr_config,
-        ));
+        trace!(?config, "new filesystem");
 
         let mem_limiter = Arc::new(MemoryLimiter::new(client.clone(), config.mem_limit));
         let prefetcher = prefetch_builder.build(runtime.clone(), mem_limiter.clone(), config.prefetcher_config);
@@ -212,7 +169,7 @@ where
 
         Self {
             config,
-            superblock,
+            superblock: mountspace.into(),
             prefetcher,
             uploader,
             next_handle: AtomicU64::new(1),
@@ -811,6 +768,7 @@ mod tests {
     use super::*;
 
     use crate::prefetch::Prefetcher;
+    use crate::{Superblock, SuperblockConfig};
 
     use fuser::FileType;
     use futures::executor::ThreadPool;
@@ -837,14 +795,22 @@ mod tests {
             server_side_encryption,
             ..Default::default()
         };
-        let mut fs = S3Filesystem::new(
-            client,
-            prefetcher_builder,
-            runtime,
+        let superblock = Box::new(Superblock::new(
+            client.clone(),
             bucket,
             &Default::default(),
-            fs_config,
-        );
+            SuperblockConfig {
+                cache_config: fs_config.cache_config.clone(),
+                s3_personality: fs_config.s3_personality,
+            },
+            crate::MakeAttrConfig {
+                uid: fs_config.uid,
+                gid: fs_config.gid,
+                file_mode: fs_config.file_mode,
+                dir_mode: fs_config.dir_mode,
+            },
+        ));
+        let mut fs = S3Filesystem::new(client, prefetcher_builder, runtime, superblock, fs_config);
 
         // Lookup inode of the dir1 directory
         let entry = fs.lookup(FUSE_ROOT_INODE, "dir1".as_ref()).await.unwrap();

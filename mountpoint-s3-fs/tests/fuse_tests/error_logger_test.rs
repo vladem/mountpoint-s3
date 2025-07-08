@@ -5,7 +5,6 @@ use mountpoint_s3_fs::fs::error_metadata::MOUNTPOINT_ERROR_INTERNAL;
 use mountpoint_s3_fs::{
     logging::error_logger::{Event, FileErrorLogger},
     manifest::Manifest,
-    S3FilesystemConfig,
 };
 use tempfile::tempdir;
 use time::OffsetDateTime;
@@ -40,10 +39,7 @@ fn test_manifest_error_logged() {
     let error_logger = Box::new(FileErrorLogger::new(tmp_dir.path(), || ()).expect("must create a error callback"));
     let manifest = Manifest::new(&manifest_db_path).unwrap();
     let test_session_config = TestSessionConfig {
-        filesystem_config: S3FilesystemConfig {
-            manifest: Some(manifest),
-            ..Default::default()
-        },
+        manifest: Some(manifest),
         error_logger: Some(error_logger),
         ..Default::default()
     };

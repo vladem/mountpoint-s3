@@ -6,6 +6,8 @@ use tracing::error;
 
 use super::db::{Db, DbEntry};
 
+use crate::prefix::PrefixError;
+use crate::s3::config::S3Path;
 use crate::superblock::path::ValidKeyError;
 
 #[derive(Debug, Error)]
@@ -22,12 +24,16 @@ pub enum ManifestError {
     InvalidKey(#[from] ValidKeyError),
     #[error("folder marker {0}")]
     FolderMarker(String),
-    #[error("invalid database row")]
-    InvalidRow,
+    #[error("invalid database row: {0}")]
+    InvalidRow(String),
     #[error("csv error")]
     CsvError(#[from] csv::Error),
     #[error("db unique constraint violation, possibly due to a shadowed key")]
     ConstraintViolation(#[source] rusqlite::Error),
+    #[error("prefix is invalid")]
+    InvalidPrefix(#[from] PrefixError),
+    #[error("channel is invalid: {0}")]
+    InvalidChannel(String),
 }
 
 /// An entry returned by manifest_lookup() and ManifestIter::next()
@@ -39,12 +45,30 @@ pub enum ManifestEntry {
         parent_id: u64,
         etag: String,
         size: usize,
+        channel_id: u64,
     },
     Directory {
         id: u64,
         full_key: String, // doesn't contain '/'
         parent_id: u64,
+        channel_id: u64,
     },
+}
+
+impl ManifestEntry {
+    /// Removes first path component, corresponding to the virtual channel directory name, from the [full_path]
+    pub fn s3_key(mut full_path: String) -> String {
+        let channel_dir_name_len = full_path.split('/').next().expect("path must contain /").len();
+        full_path.drain(..channel_dir_name_len + 1);
+        full_path
+    }
+
+    pub fn get_full_key(&self) -> &str {
+        match self {
+            ManifestEntry::File { full_key, .. } => full_key,
+            ManifestEntry::Directory { full_key, .. } => full_key,
+        }
+    }
 }
 
 impl TryFrom<DbEntry> for ManifestEntry {
@@ -52,11 +76,15 @@ impl TryFrom<DbEntry> for ManifestEntry {
 
     fn try_from(db_entry: DbEntry) -> Result<Self, Self::Error> {
         if db_entry.full_key.ends_with('/') {
-            return Err(ManifestError::InvalidRow);
+            return Err(ManifestError::InvalidRow(db_entry.full_key.clone()));
         }
 
         let Some(parent_id) = db_entry.parent_id else {
-            return Err(ManifestError::InvalidRow);
+            return Err(ManifestError::InvalidRow(db_entry.full_key.clone()));
+        };
+
+        let Some(channel_id) = db_entry.channel_id else {
+            return Err(ManifestError::InvalidRow(db_entry.full_key.clone()));
         };
 
         match (db_entry.etag, db_entry.size) {
@@ -64,6 +92,7 @@ impl TryFrom<DbEntry> for ManifestEntry {
                 id: db_entry.id,
                 full_key: db_entry.full_key,
                 parent_id,
+                channel_id,
             }),
             (Some(etag), Some(size)) => Ok(ManifestEntry::File {
                 id: db_entry.id,
@@ -71,8 +100,9 @@ impl TryFrom<DbEntry> for ManifestEntry {
                 parent_id,
                 etag,
                 size,
+                channel_id,
             }),
-            _ => Err(ManifestError::InvalidRow),
+            _ => Err(ManifestError::InvalidRow(db_entry.full_key.clone())),
         }
     }
 }
@@ -111,6 +141,10 @@ impl Manifest {
     /// Create an iterator over directory's direct children
     pub fn iter(&self, parent_id: u64) -> ManifestIter {
         ManifestIter::new(self.db.clone(), parent_id)
+    }
+
+    pub fn channels(&self) -> Result<Vec<S3Path>, ManifestError> {
+        Ok(self.db.load_channels()?)
     }
 }
 
@@ -187,5 +221,17 @@ impl ManifestIter {
         self.entries.extend(manifest_entries?);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::ManifestEntry;
+    use test_case::test_case;
+
+    #[test_case("channel_0/dir/a.txt", "dir/a.txt"; "ascii virtual dir name")]
+    #[test_case("通道_0/目录/a.txt", "目录/a.txt"; "unicode virtual dir name")]
+    fn test_entry_s3_key(full_path: &str, s3_key: &str) {
+        assert_eq!(&ManifestEntry::s3_key(full_path.to_string()), s3_key);
     }
 }

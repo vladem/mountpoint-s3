@@ -1,17 +1,22 @@
+use rusqlite::types::Type;
 use rusqlite::{Connection, Error, OptionalExtension, Result, Row};
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::prefix::Prefix;
+use crate::s3::config::S3Path;
+
 #[derive(Debug, Clone, PartialEq, Hash, Eq, Deserialize, Default)]
 pub struct DbEntry {
     #[serde(skip)]
     pub id: u64,
-    /// S3 key of the object.
+    /// S3 key of the object with virtual channel directory prepended.
     ///
     /// When a bucket prefix is mounted, this field does not contain prefix when stored or loaded from the DB.
     /// Both files and directories don't have '/' in the end.
+    /// TODO: better name
     pub full_key: String,
     #[serde(skip)]
     pub name_offset: Option<u64>,
@@ -19,6 +24,8 @@ pub struct DbEntry {
     pub parent_id: Option<u64>,
     pub etag: Option<String>,
     pub size: Option<usize>,
+    #[serde(skip)]
+    pub channel_id: Option<u64>,
 }
 
 impl TryFrom<&Row<'_>> for DbEntry {
@@ -32,6 +39,7 @@ impl TryFrom<&Row<'_>> for DbEntry {
             parent_id: row.get(2)?,
             etag: row.get(3)?,
             size: row.get(4)?,
+            channel_id: row.get(5)?,
         })
     }
 }
@@ -58,7 +66,7 @@ impl Db {
         metrics::histogram!("manifest.lookup.lock.elapsed_micros").record(start.elapsed().as_micros() as f64);
 
         let start = Instant::now();
-        let query = "SELECT id, key, parent_id, etag, size FROM s3_objects WHERE id = ?1";
+        let query = "SELECT id, key, parent_id, etag, size, channel_id FROM s3_objects WHERE id = ?1";
         tracing::debug!("executing {} with parameters {:?}", query, (id,));
         let mut stmt = conn.prepare(query)?;
         let result = stmt.query_row((id,), |row: &Row| row.try_into()).optional();
@@ -74,7 +82,8 @@ impl Db {
         metrics::histogram!("manifest.lookup_by_id.lock.elapsed_micros").record(start.elapsed().as_micros() as f64);
 
         let start = Instant::now();
-        let query = "SELECT id, key, parent_id, etag, size FROM s3_objects WHERE parent_id = ?1 AND name = ?2";
+        let query =
+            "SELECT id, key, parent_id, etag, size, channel_id FROM s3_objects WHERE parent_id = ?1 AND name = ?2";
         tracing::debug!("executing {} with parameters {:?}", query, (parent_id, name,));
         let mut stmt = conn.prepare(query)?;
         let result = stmt.query_row((parent_id, name), |row: &Row| row.try_into()).optional();
@@ -97,7 +106,7 @@ impl Db {
         metrics::histogram!("manifest.readdir.lock.elapsed_micros").record(start.elapsed().as_micros() as f64);
 
         let start = Instant::now();
-        let query = "SELECT id, key, parent_id, etag, size FROM s3_objects WHERE parent_id = ?1 ORDER BY name LIMIT ?2 OFFSET ?3";
+        let query = "SELECT id, key, parent_id, etag, size, channel_id FROM s3_objects WHERE parent_id = ?1 ORDER BY name LIMIT ?2 OFFSET ?3";
         tracing::debug!(
             "executing {} with parameters {:?}",
             query,
@@ -115,6 +124,7 @@ impl Db {
     pub fn create_table(&self) -> Result<()> {
         let conn = self.conn.lock().expect("lock must succeed");
         // NOTE: SUBSTR in SQLite starts indexing from 1 (name_offset column assumes left-most character has index 0)
+        // TODO: use implicit rowid?
         conn.execute(
             "CREATE TABLE s3_objects (
                 id          INTEGER   PRIMARY KEY,
@@ -123,7 +133,17 @@ impl Db {
                 name        TEXT      GENERATED ALWAYS AS (SUBSTR(key,name_offset + 1)) VIRTUAL,
                 parent_id   INTEGER   NOT NULL,
                 etag        TEXT      NULL,
-                size        INTEGER   NULL
+                size        INTEGER   NULL,
+                channel_id  INTEGER   NOT NULL
+            )",
+            (),
+        )?;
+
+        conn.execute(
+            "CREATE TABLE channels (
+                id          INTEGER   PRIMARY KEY,
+                bucket_name TEXT      NOT NULL,
+                prefix      TEXT      NOT NULL
             )",
             (),
         )?;
@@ -143,7 +163,7 @@ impl Db {
         let mut conn = self.conn.lock().expect("lock must succeed");
         let tx = conn.transaction()?;
         let mut stmt = tx.prepare(
-            "INSERT INTO s3_objects (id, key, name_offset, parent_id, etag, size) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO s3_objects (id, key, name_offset, parent_id, etag, size, channel_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for entry in entries {
             stmt.execute((
@@ -153,9 +173,42 @@ impl Db {
                 entry.parent_id,
                 entry.etag.as_deref(),
                 entry.size,
+                entry.channel_id,
             ))?;
         }
         drop(stmt);
         tx.commit()
+    }
+
+    pub fn insert_channels(&self, channels: Vec<S3Path>) -> Result<()> {
+        let mut conn = self.conn.lock().expect("lock must succeed");
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare("INSERT INTO channels (id, bucket_name, prefix) VALUES (?1, ?2, ?3)")?;
+        for (id, channel) in channels.into_iter().enumerate() {
+            stmt.execute((id, channel.bucket_name, channel.prefix.as_str()))?;
+        }
+        drop(stmt);
+        tx.commit()
+    }
+
+    pub fn load_channels(&self) -> Result<Vec<S3Path>> {
+        let conn = self.conn.lock().expect("lock must succeed");
+
+        // assume channel ids is a contiguous sequence of integers starting from 0
+        let query = "SELECT bucket_name, prefix FROM channels ORDER BY id";
+        tracing::debug!("executing {} with parameters", query);
+        let mut stmt = conn.prepare(query)?;
+        let result: Result<Vec<S3Path>> = stmt
+            .query_map((), |row: &Row| {
+                let prefix_string: String = row.get(1)?;
+                Ok(S3Path {
+                    bucket_name: row.get(0)?,
+                    prefix: Prefix::new(&prefix_string)
+                        .map_err(|err| Error::FromSqlConversionFailure(0, Type::Null, Box::new(err)))?,
+                })
+            })?
+            .collect();
+
+        result
     }
 }
