@@ -653,18 +653,16 @@ impl<OC: ObjectClient + Send + Sync + Clone> Metablock for Superblock<OC> {
                 return Err(InodeError::NotADirectory(parent.err()));
             }
             InodeKindData::Directory { children, .. } => {
-                // We want to remove the original child.
-                // We assume that the VFS will hold a lock on the parent and child.
-                // However, we don't hold this lock over remote calls as we don't want to move to async locks right now.
-                // Instead, we will panic when our assumption appears broken.
-                let removed_inode = children
-                    .remove(inode.name())
-                    .expect("parent should contain child assuming VFS does not permit concurrent op on parent");
-                assert_eq!(
-                    removed_inode.ino(),
-                    inode.ino(),
-                    "child ino number shouldn't change assuming VFS does not permit concurrent op on parent",
-                );
+                // We want to remove the original child, thus we panic if inode with a different number was removed.
+                // Panicing is important because this may signal of a durability issue: inode re-created during deletion.
+                // If for some reason child with the specified name was already removed, we do nothing.
+                if let Some(removed_inode) = children.remove(inode.name()) {
+                    assert_eq!(
+                        removed_inode.ino(),
+                        inode.ino(),
+                        "child ino number shouldn't change assuming VFS does not permit concurrent op on parent",
+                    );
+                }
             }
         };
 
