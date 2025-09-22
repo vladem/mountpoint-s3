@@ -60,6 +60,8 @@ macro_rules! request_span {
     ($self:expr, $method:expr) => { request_span!($self, $method,) };
 }
 
+mod logged_buffer;
+
 pub(crate) mod copy_object;
 pub(crate) mod delete_object;
 pub(crate) mod get_object;
