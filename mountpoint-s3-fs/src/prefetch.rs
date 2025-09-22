@@ -42,7 +42,9 @@ use tracing::trace;
 use crate::checksums::{ChecksummedBytes, IntegrityError};
 use crate::data_cache::DataCache;
 use crate::fs::error_metadata::{ErrorMetadata, MOUNTPOINT_ERROR_CLIENT};
+use crate::mem_limiter::MemoryLimiter;
 use crate::object::ObjectId;
+use crate::sync::Arc;
 
 mod backpressure_controller;
 mod builder;
@@ -170,6 +172,7 @@ fn determine_max_read_size() -> usize {
 pub struct Prefetcher<Client> {
     part_stream: PartStream<Client>,
     config: PrefetcherConfig,
+    mem_limiter: Arc<MemoryLimiter>,
 }
 
 impl<Client> Prefetcher<Client>
@@ -190,8 +193,12 @@ where
     }
 
     /// Create a new [Prefetcher] from the given [ObjectPartStream] instance.
-    pub fn new(part_stream: PartStream<Client>, config: PrefetcherConfig) -> Self {
-        Self { part_stream, config }
+    pub fn new(part_stream: PartStream<Client>, config: PrefetcherConfig, mem_limiter: Arc<MemoryLimiter>) -> Self {
+        Self {
+            part_stream,
+            config,
+            mem_limiter,
+        }
     }
 
     /// Start a new prefetch request to the specified object.
@@ -199,7 +206,14 @@ where
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
     {
-        PrefetchGetObject::new(self.part_stream.clone(), self.config, bucket, object_id, size)
+        PrefetchGetObject::new(
+            self.part_stream.clone(),
+            self.config,
+            bucket,
+            object_id,
+            size,
+            self.mem_limiter.clone(),
+        )
     }
 }
 
@@ -237,12 +251,13 @@ where
         bucket: String,
         object_id: ObjectId,
         size: u64,
+        mem_limiter: Arc<MemoryLimiter>,
     ) -> Self {
         PrefetchGetObject {
             part_stream,
             config,
             backpressure_task: None,
-            backward_seek_window: SeekWindow::new(config.max_backward_seek_distance as usize),
+            backward_seek_window: SeekWindow::new(config.max_backward_seek_distance as usize, mem_limiter),
             preferred_part_size: 128 * 1024,
             sequential_read_start_offset: 0,
             next_sequential_read_offset: 0,
@@ -286,6 +301,9 @@ where
         // We initialize this value to 128k as it is the Linux's readahead size
         // and it can also be used as a lower bound in case the read size is too small.
         // The upper bound is 1MiB since it should be a common IO size.
+        //
+        // TODO, adjust documentation: `preferred_part_size` is effectively static now,
+        // (only passed to `RequestTask` at the beginning and prefetcher reset)
         let max_preferred_part_size = 1024 * 1024;
         self.preferred_part_size = self.preferred_part_size.max(length).min(max_preferred_part_size);
 

@@ -1,5 +1,10 @@
 use std::collections::VecDeque;
 
+use crate::{
+    mem_limiter::{BufferArea, MemoryLimiter},
+    sync::Arc,
+};
+
 use super::part::Part;
 
 /// A backwards seek window for a single prefetch stream. Parts can be pushed onto the end of the
@@ -10,15 +15,21 @@ pub struct SeekWindow {
     parts: VecDeque<Part>,
     max_size: usize,
     current_size: usize,
+    mem_limiter: Arc<MemoryLimiter>,
+    part_size: u64,
 }
 
 impl SeekWindow {
-    pub fn new(max_size: usize) -> Self {
+    pub fn new(max_size: usize, mem_limiter: Arc<MemoryLimiter>) -> Self {
         assert!(max_size > 0);
+        let part_size = 8 * 1024 * 1024;
+        mem_limiter.reserve(BufferArea::Prefetch, part_size);
         SeekWindow {
             parts: VecDeque::new(),
             max_size,
             current_size: 0,
+            mem_limiter,
+            part_size,
         }
     }
 
@@ -74,5 +85,11 @@ impl SeekWindow {
     pub fn clear(&mut self) {
         self.parts.drain(..);
         self.current_size = 0;
+    }
+}
+
+impl Drop for SeekWindow {
+    fn drop(&mut self) {
+        self.mem_limiter.release(BufferArea::Prefetch, self.part_size);
     }
 }

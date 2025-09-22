@@ -227,7 +227,7 @@ impl<Client: ObjectClient + Clone + Send + Sync + 'static> ObjectPartStream<Clie
         };
         let (backpressure_controller, mut backpressure_limiter) =
             new_backpressure_controller(backpressure_config, self.mem_limiter.clone());
-        let (part_queue, part_queue_producer) = unbounded_part_queue(self.mem_limiter.clone());
+        let (part_queue, part_queue_producer) = unbounded_part_queue();
         trace!(?range, "spawning request");
 
         let span = debug_span!("prefetch", ?range);
@@ -336,6 +336,7 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
                 bucket.clone(),
                 object_id.clone(),
                 first_req_range.into(),
+                false,
             );
             pin_mut!(first_request_stream);
             while let Some(next) = first_request_stream.next().await {
@@ -388,6 +389,7 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
                 bucket.clone(),
                 object_id.clone(),
                 range.into(),
+                true,
             );
             pin_mut!(request_stream);
             while let Some(next) = request_stream.next().await {
@@ -406,8 +408,10 @@ fn read_from_request<'a, Client: ObjectClient + 'a>(
     bucket: String,
     id: ObjectId,
     request_range: Range<u64>,
+    update_read_window: bool,
 ) -> impl Stream<Item = RequestReaderOutput<Client::ClientError>> + 'a {
     try_stream! {
+        tracing::warn!(request_start=request_range.start, request_end=request_range.end, "starting get object request");
         let mut request = client
             .get_object(&bucket, id.key(), &GetObjectParams::new().range(Some(request_range.clone())).if_match(Some(id.etag().clone())))
             .await
@@ -417,7 +421,17 @@ fn read_from_request<'a, Client: ObjectClient + 'a>(
         let mut client_backpressure_handle = request.backpressure_handle()
             .expect("S3 client backpressure should always be enabled in Mountpoint")
             .clone();
-        client_backpressure_handle.ensure_read_window(backpressure_limiter.read_window_end_offset());
+        let part_size = client.read_part_size() as u64;
+        let next_read_window_end_offset = backpressure_limiter.read_window_end_offset();
+        let relative_read_window_end = next_read_window_end_offset - request_range.start;
+        assert!(
+            next_read_window_end_offset >= request_range.end || (relative_read_window_end % part_size == 0),
+            "read window must be aligned with part boundaries, relative_read_window_end={}, part_size={}, request_end={}",
+            relative_read_window_end,
+            part_size,
+            request_range.end,
+        );
+        client_backpressure_handle.ensure_read_window(next_read_window_end_offset);
 
         pin_mut!(request);
         while let Some(next) = request.next().await {
@@ -444,12 +458,26 @@ fn read_from_request<'a, Client: ObjectClient + 'a>(
                 metrics::histogram!("s3.client.read_window_excess_bytes").record(excess_bytes as f64);
             }
 
+            // ensure that all window increments are consumed by the second "main" request,
+            // (read window for the initial request is initialized to the size of the request)
+            if !update_read_window {
+                continue;
+            }
+
             // When we detect an updated read window end offset, pass this signal on to the S3 client.
             // TODO:
             //   It does not make sense to 'block' here. In reality, we don't actually block here anyway.
             //   This serves instead as the point where we react to the backpressure, and send signals to the S3 client.
             //   Instead, the backpressure controller or an async task could communicate directly with the client.
             if let Some(next_read_window_end_offset) = backpressure_limiter.wait_for_read_window_increment(next_offset).await? {
+                let relative_read_window_end = next_read_window_end_offset - request_range.start;
+                assert!(
+                    next_read_window_end_offset >= request_range.end || (relative_read_window_end % part_size == 0),
+                    "read window must be aligned with part boundaries, relative_read_window_end={}, part_size={}, request_end={}",
+                    relative_read_window_end,
+                    part_size,
+                    request_range.end,
+                );
                 client_backpressure_handle.ensure_read_window(next_read_window_end_offset);
             }
         }

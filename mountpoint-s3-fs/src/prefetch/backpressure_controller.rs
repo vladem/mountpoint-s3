@@ -50,6 +50,9 @@ pub struct BackpressureController {
     read_window_end_offset: u64,
     /// Next offset of the data to be read, relative to the start of the S3 object.
     next_read_offset: u64,
+    /// Start offset of the second "main" request to S3. This helps in aligning window ends of the
+    /// request with part boundaries.
+    second_request_start: u64,
     /// End offset within the S3 object for the request.
     ///
     /// The request can return data up to this offset *exclusively*.
@@ -95,6 +98,7 @@ pub fn new_backpressure_controller(
     let controller = BackpressureController {
         read_window_updater,
         preferred_read_window_size: config.initial_read_window_size,
+        second_request_start: config.request_range.start + config.initial_read_window_size as u64,
         min_read_window_size: config.min_read_window_size,
         max_read_window_size: config.max_read_window_size,
         read_window_size_multiplier: config.read_window_size_multiplier.max(MIN_WINDOW_SIZE_MULTIPLIER),
@@ -125,6 +129,7 @@ impl BackpressureController {
             // Note, that this may come from a backwards seek, so offsets observed by this method are not necessarily ascending
             BackpressureFeedbackEvent::DataRead { offset, length } => {
                 self.next_read_offset = offset + length as u64;
+                // TODO: release only when full part was consumed (or we reached the end)
                 self.mem_limiter.release(BufferArea::Prefetch, length as u64);
                 let remaining_window = self.read_window_end_offset.saturating_sub(self.next_read_offset) as usize;
 
@@ -136,8 +141,14 @@ impl BackpressureController {
                 {
                     let new_read_window_end_offset = self
                         .next_read_offset
-                        .saturating_add(self.preferred_read_window_size as u64)
-                        .min(self.request_end_offset);
+                        .saturating_add(self.preferred_read_window_size as u64);
+                    let new_read_window_end_offset = round_up_to_part_boundary(
+                        new_read_window_end_offset,
+                        self.second_request_start,
+                        self.min_read_window_size as u64,
+                    );
+                    // TODO: in the end of the request we still have up to "part_size" of unaccounted memory, should we reserve in full parts?
+                    let new_read_window_end_offset = new_read_window_end_offset.min(self.request_end_offset);
                     // We can skip if the new `read_window_end_offset` is less than or equal to the current one, this
                     // could happen after the read window is scaled down.
                     if new_read_window_end_offset <= self.read_window_end_offset {
@@ -320,6 +331,28 @@ impl ReadWindowIncrementQueue {
     }
 }
 
+/// Round up `offset` to next part boundary (relative to request start).
+///
+/// This function ensures that read window end offsets are aligned to part boundaries for the second request,
+/// which helps optimize memory usage.
+///
+/// If the offset is before the second request start, it returns the offset unchanged.
+fn round_up_to_part_boundary(offset: u64, second_req_start: u64, part_size: u64) -> u64 {
+    let res = if offset > second_req_start {
+        let relative_end_offset = offset - second_req_start;
+        if relative_end_offset % part_size != 0 {
+            let aligned_relative_offset = part_size * (relative_end_offset / part_size + 1);
+            second_req_start + aligned_relative_offset
+        } else {
+            offset
+        }
+    } else {
+        offset
+    };
+    trace!(offset, second_req_start, part_size, res, "read window end round up",);
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +366,17 @@ mod tests {
     use crate::mem_limiter::MemoryLimiter;
     use crate::memory::PagedPool;
     use crate::s3::config::INITIAL_READ_WINDOW_SIZE;
+
+    #[test_case(500, 1000, 100, 500; "offset before second request start")]
+    #[test_case(1500, 1000, 512, 1512; "offset after second request start, needs rounding up")]
+    #[test_case(2024, 1000, 512, 2024; "offset after second request start, already aligned")]
+    #[test_case(1001, 1000, 512, 1512; "offset just after second request start, needs rounding up")]
+    #[test_case(1512, 1000, 512, 1512; "offset exactly at part boundary")]
+    #[test_case(1513, 1000, 512, 2024; "offset just past part boundary")]
+    fn test_round_up_to_part_boundary(offset: u64, second_req_start: u64, part_size: u64, expected: u64) {
+        let result = round_up_to_part_boundary(offset, second_req_start, part_size);
+        assert_eq!(result, expected);
+    }
 
     #[test_case(INITIAL_READ_WINDOW_SIZE, 2)] // real config
     #[test_case(3 * 1024 * 1024, 4)]
