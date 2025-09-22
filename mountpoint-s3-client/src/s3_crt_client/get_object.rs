@@ -20,6 +20,7 @@ use crate::object_client::{
     Checksum, ChecksumMode, ClientBackpressureHandle, GetBodyPart, GetObjectError, GetObjectParams, GetObjectResponse,
     ObjectChecksumError, ObjectClientError, ObjectClientResult, ObjectMetadata,
 };
+use crate::s3_crt_client::logged_buffer::LoggedOwnedBuffer;
 
 use super::{CancellingMetaRequest, ResponseHeadersError, S3CrtClient, S3Operation, S3RequestError, parse_checksum};
 
@@ -35,6 +36,7 @@ impl S3CrtClient {
         let requested_checksums = params.checksum_mode.as_ref() == Some(&ChecksumMode::Enabled);
         let next_offset = params.range.as_ref().map(|r| r.start).unwrap_or(0);
         let (event_sender, mut event_receiver) = futures::channel::mpsc::unbounded();
+        let key_copy = key.to_string();
         let meta_request = {
             let span =
                 request_span!(self.inner, "get_object", bucket, key, range=?params.range, if_match=?params.if_match);
@@ -101,7 +103,8 @@ impl S3CrtClient {
                     let owned_buffer = data
                         .to_owned_buffer()
                         .expect("buffers returned from GetObject can always be acquired");
-                    let bytes = Bytes::from_owner(owned_buffer);
+                    let logged_buffer = LoggedOwnedBuffer::new(owned_buffer, key_copy.clone(), offset);
+                    let bytes = Bytes::from_owner(logged_buffer);
                     let body_part = GetBodyPart { offset, data: bytes };
                     _ = part_sender.unbounded_send(S3GetObjectEvent::BodyPart(body_part));
                 },
@@ -165,7 +168,9 @@ pub struct S3BackpressureHandle {
 
 impl ClientBackpressureHandle for S3BackpressureHandle {
     fn increment_read_window(&mut self, len: usize) {
-        self.read_window_end_offset.fetch_add(len as u64, Ordering::SeqCst);
+        let old_offset = self.read_window_end_offset.fetch_add(len as u64, Ordering::SeqCst);
+        let window_end = old_offset + len as u64;
+        tracing::warn!(window_end, "increment_read_window");
         self.meta_request.increment_read_window(len as u64);
     }
 
