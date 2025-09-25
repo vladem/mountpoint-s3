@@ -28,6 +28,7 @@ pub struct BackpressureConfig {
     pub read_window_size_multiplier: usize,
     /// Request range to apply backpressure
     pub request_range: Range<u64>,
+    pub key: String,
 }
 
 /// A [BackpressureController] should be given to consumers of a byte stream.
@@ -58,6 +59,7 @@ pub struct BackpressureController {
     ///
     /// For example, when memory is low we should scale down [Self::preferred_read_window_size].
     mem_limiter: Arc<MemoryLimiter>,
+    key: String,
 }
 
 /// The [BackpressureLimiter] is used on producer side of a stream, for example,
@@ -87,6 +89,8 @@ pub fn new_backpressure_controller(
     // Minimum window size multiplier as the scaling up and down won't work if the multiplier is 1.
     const MIN_WINDOW_SIZE_MULTIPLIER: usize = 2;
     let read_window_end_offset = config.request_range.start + config.initial_read_window_size as u64;
+    tracing::warn!(key=config.key, offset=config.request_range.start, length=0, "BackpressureFeedbackEvent::DataRead");
+    tracing::warn!(key=config.key, new_read_window_end_offset=read_window_end_offset, "BackpressureFeedbackEvent::IncrementReadWindow");
     mem_limiter.reserve(BufferArea::Prefetch, config.initial_read_window_size as u64);
 
     let (read_window_updater, read_window_increment_queue) = unbounded();
@@ -102,6 +106,7 @@ pub fn new_backpressure_controller(
         next_read_offset: config.request_range.start,
         request_end_offset: config.request_range.end,
         mem_limiter,
+        key: config.key
     };
 
     let limiter = BackpressureLimiter {
@@ -125,6 +130,7 @@ impl BackpressureController {
             // Note, that this may come from a backwards seek, so offsets observed by this method are not necessarily ascending
             BackpressureFeedbackEvent::DataRead { offset, length } => {
                 self.next_read_offset = offset + length as u64;
+                tracing::warn!(key=self.key, offset, length, "BackpressureFeedbackEvent::DataRead");
                 self.mem_limiter.release(BufferArea::Prefetch, length as u64);
                 let remaining_window = self.read_window_end_offset.saturating_sub(self.next_read_offset) as usize;
 
@@ -148,6 +154,7 @@ impl BackpressureController {
                     // Force incrementing read window regardless of available memory when we are already at minimum
                     // read window size.
                     if self.preferred_read_window_size <= self.min_read_window_size {
+                        tracing::warn!(key=self.key, new_read_window_end_offset, "BackpressureFeedbackEvent::IncrementReadWindow");
                         self.mem_limiter.reserve(BufferArea::Prefetch, to_increase as u64);
                         self.increment_read_window(to_increase).await;
                         break;
@@ -156,6 +163,7 @@ impl BackpressureController {
                     // Try to reserve the memory for the length we want to increase before sending the request,
                     // scale down the read window if it fails.
                     if self.mem_limiter.try_reserve(BufferArea::Prefetch, to_increase as u64) {
+                        tracing::warn!(key=self.key, new_read_window_end_offset, "BackpressureFeedbackEvent::IncrementReadWindow");
                         self.increment_read_window(to_increase).await;
                         break;
                     } else {
@@ -242,6 +250,7 @@ impl Drop for BackpressureController {
         // Free up memory we have reserved for the read window.
         let remaining_window = self.read_window_end_offset.saturating_sub(self.next_read_offset);
         self.mem_limiter.release(BufferArea::Prefetch, remaining_window);
+        tracing::warn!(key=self.key, offset=self.read_window_end_offset, length=0, "BackpressureFeedbackEvent::DataRead");
     }
 }
 
