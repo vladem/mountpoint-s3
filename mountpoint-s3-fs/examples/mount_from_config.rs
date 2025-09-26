@@ -5,7 +5,7 @@ use clap::Parser;
 use mountpoint_s3_client::{config::AddressingStyle, instance_info::InstanceInfo, user_agent::UserAgent};
 use mountpoint_s3_fs::{
     MountpointConfig, Runtime, S3FilesystemConfig, autoconfigure,
-    data_cache::{CacheLimit, DataCacheConfig, DiskDataCacheConfig, ManagedCacheDir},
+    data_cache::{CacheLimit, DataCacheConfig, DiskDataCacheConfig},
     fs::CacheConfig,
     fuse::{
         ErrorLogger,
@@ -183,10 +183,7 @@ impl ConfigOptions {
                 tracing::trace!("using no cache");
             }
         }
-        Ok(DataCacheConfig {
-            disk_cache_config,
-            express_cache_config: None,
-        })
+        Ok(DataCacheConfig::from_disk_cache_config(disk_cache_config))
     }
 
     fn determine_throughput(&self) -> Result<TargetThroughputSetting> {
@@ -273,17 +270,6 @@ fn setup_logging(config: &ConfigOptions) -> Result<(LoggingHandle, MetricsSinkHa
     Ok((logging, metrics))
 }
 
-fn setup_disk_cache_directory(cache_config: &mut DataCacheConfig) -> anyhow::Result<Option<ManagedCacheDir>> {
-    let Some(disk_cache_config) = &mut cache_config.disk_cache_config else {
-        return Ok(None);
-    };
-    let managed_cache_dir =
-        ManagedCacheDir::new_from_parent_with_cache_key(&disk_cache_config.cache_directory, None, true)
-            .context("failed to create cache directory")?;
-    disk_cache_config.cache_directory = managed_cache_dir.as_path_buf();
-    Ok(Some(managed_cache_dir))
-}
-
 fn mount_filesystem(
     config: &ConfigOptions,
     manifest: Manifest,
@@ -292,7 +278,11 @@ fn mount_filesystem(
     // Create the Mountpoint configuration
     let fs_config = config.build_filesystem_config()?;
     let mut data_cache_config = config.build_data_cache_config()?;
-    let managed_cache_dir = setup_disk_cache_directory(&mut data_cache_config)?;
+    let managed_cache_dir = if let Some(disk_cache_config) = &mut data_cache_config.disk_cache_config {
+        disk_cache_config.setup_disk_cache_directory(None, true)?
+    } else {
+        None
+    };
     let mp_config = MountpointConfig::new(config.build_fuse_session_config()?, fs_config, data_cache_config)
         .error_logger(error_logger);
 

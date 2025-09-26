@@ -1,11 +1,13 @@
 //! Module for the on-disk data cache implementation.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use bincode::config::{Configuration, Fixint, Limit, LittleEndian};
 use bincode::error::{DecodeError, EncodeError};
@@ -19,7 +21,7 @@ use thiserror::Error;
 use tracing::{trace, warn};
 
 use crate::checksums::IntegrityError;
-use crate::data_cache::DataCacheError;
+use crate::data_cache::{DataCacheError, ManagedCacheDir};
 use crate::memory::{BufferKind, PagedPool};
 use crate::object::ObjectId;
 use crate::sync::Mutex;
@@ -609,6 +611,23 @@ where
         let (key, size) = self.entries.pop_front()?;
         self.size = self.size.saturating_sub(size);
         Some(key)
+    }
+}
+
+impl DiskDataCacheConfig {
+    pub fn setup_disk_cache_directory(
+        &mut self,
+        cache_key: Option<OsString>,
+        should_cleanup_cache_dir: bool,
+    ) -> anyhow::Result<Option<ManagedCacheDir>> {
+        let managed_cache_dir = ManagedCacheDir::new_from_parent_with_cache_key(
+            &self.cache_directory,
+            cache_key.as_deref(),
+            should_cleanup_cache_dir,
+        )
+        .context("failed to create cache directory")?;
+        self.cache_directory = managed_cache_dir.as_path_buf();
+        Ok(Some(managed_cache_dir))
     }
 }
 

@@ -7,7 +7,6 @@ use std::{env, fs};
 
 use anyhow::{Context as _, anyhow};
 use mountpoint_s3_client::{ObjectClient, S3CrtClient};
-use mountpoint_s3_fs::data_cache::{DataCacheConfig, ManagedCacheDir};
 use mountpoint_s3_fs::fuse::session::FuseSession;
 use mountpoint_s3_fs::logging::init_logging;
 use mountpoint_s3_fs::memory::PagedPool;
@@ -228,7 +227,11 @@ fn mount(args: CliArgs, client_builder: impl ClientBuilder) -> anyhow::Result<Fu
     let filesystem_config = args.filesystem_config(sse.clone(), s3_personality);
     let mut data_cache_config = args.data_cache_config(sse)?;
 
-    let managed_cache_dir = setup_disk_cache_directory(&mut data_cache_config)?;
+    let managed_cache_dir = if let Some(disk_cache_config) = &mut data_cache_config.disk_cache_config {
+        disk_cache_config.setup_disk_cache_directory(env_unstable_cache_key(), should_cleanup_cache_dir())?
+    } else {
+        None
+    };
 
     tracing::debug!(?fuse_session_config, "creating fuse session");
     let mount_point_path = format!("{}", fuse_session_config.mount_point());
@@ -302,21 +305,6 @@ pub fn create_s3_client(
         personality.unwrap_or_else(|| S3Personality::infer_from_bucket(&s3_path.bucket, &client.endpoint_config()));
 
     Ok((client, runtime, s3_personality))
-}
-
-fn setup_disk_cache_directory(cache_config: &mut DataCacheConfig) -> anyhow::Result<Option<ManagedCacheDir>> {
-    let Some(disk_cache_config) = &mut cache_config.disk_cache_config else {
-        return Ok(None);
-    };
-    let cache_key = env_unstable_cache_key();
-    let managed_cache_dir = ManagedCacheDir::new_from_parent_with_cache_key(
-        &disk_cache_config.cache_directory,
-        cache_key.as_deref(),
-        should_cleanup_cache_dir(),
-    )
-    .context("failed to create cache directory")?;
-    disk_cache_config.cache_directory = managed_cache_dir.as_path_buf();
-    Ok(Some(managed_cache_dir))
 }
 
 /// Return if [ManagedCacheDir] should be configured with cleanup disabled or not.

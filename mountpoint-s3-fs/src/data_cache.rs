@@ -97,3 +97,12 @@ pub struct DataCacheConfig {
     pub disk_cache_config: Option<DiskDataCacheConfig>,
     pub express_cache_config: Option<ExpressDataCacheConfig>,
 }
+
+impl DataCacheConfig {
+    pub fn from_disk_cache_config(disk_cache_config: Option<DiskDataCacheConfig>) -> DataCacheConfig {
+        DataCacheConfig {
+            disk_cache_config,
+            express_cache_config: None,
+        }
+    }
+}
