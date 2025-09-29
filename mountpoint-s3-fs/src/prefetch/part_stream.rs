@@ -232,6 +232,7 @@ impl<Client: ObjectClient + Clone + Send + Sync + 'static> ObjectPartStream<Clie
 
         let span = debug_span!("prefetch", ?range);
         let client = self.client.clone();
+        let mem_limiter = self.mem_limiter.clone();
         let task_handle = self
             .runtime
             .spawn_with_handle(
@@ -244,6 +245,8 @@ impl<Client: ObjectClient + Clone + Send + Sync + 'static> ObjectPartStream<Clie
                         config.object_id.clone(),
                         first_read_window_end_offset,
                         config.range,
+                        mem_limiter,
+                        config.read_part_size as u64,
                     );
 
                     let part_composer = ClientPartComposer {
@@ -317,6 +320,7 @@ where
 /// This is a workaround for a specific issue where initial read window size could be very small (~1MB), but the CRT only returns data
 /// in chunks of part size (default to 8MB) even if initial read window is smaller than that, which make time to first byte much higher
 /// than expected.
+#[allow(clippy::too_many_arguments)]
 pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
     backpressure_limiter: &'a mut BackpressureLimiter,
     client: &'a Client,
@@ -324,6 +328,8 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
     object_id: ObjectId,
     first_read_window_end_offset: u64,
     range: RequestRange,
+    mem_limiter: Arc<MemoryLimiter>,
+    part_size: u64,
 ) -> impl Stream<Item = RequestReaderOutput<Client::ClientError>> + 'a {
     try_stream! {
         // Let's start by issuing the first request with a range trimmed to initial read window offset
@@ -336,6 +342,9 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
                 bucket.clone(),
                 object_id.clone(),
                 first_req_range.into(),
+                mem_limiter.clone(),
+                false, // is_second_request
+                part_size,
             );
             pin_mut!(first_request_stream);
             while let Some(next) = first_request_stream.next().await {
@@ -388,6 +397,9 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
                 bucket.clone(),
                 object_id.clone(),
                 range.into(),
+                mem_limiter.clone(),
+                true, // is_second_request
+                part_size,
             );
             pin_mut!(request_stream);
             while let Some(next) = request_stream.next().await {
@@ -397,15 +409,70 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
     }
 }
 
+/// Round up `offset` to next part boundary (relative to request start).
+///
+/// This function ensures that read window end offsets are aligned to part boundaries for the second request,
+/// which helps optimize memory usage.
+///
+/// If the offset is before the second request start, it returns the offset unchanged.
+fn round_up_to_part_boundary(offset: u64, second_req_start: u64, part_size: u64) -> u64 {
+    assert!(offset > second_req_start);
+    let relative_end_offset = offset - second_req_start;
+    if relative_end_offset % part_size != 0 {
+        let aligned_relative_offset = part_size * (relative_end_offset / part_size + 1);
+        second_req_start + aligned_relative_offset
+    } else {
+        offset
+    }
+}
+
+/// Reserve memory and round up read window end offset to part boundaries for second requests.
+///
+/// This function handles the common pattern of rounding up the read window end offset to part boundaries
+/// for second requests and reserving additional memory if needed.
+///
+/// Returns the potentially adjusted read window end offset.
+fn reserve_up_to_part_boundary(
+    read_window_end_offset: u64,
+    request_range_start: u64,
+    request_range_end: u64,
+    part_size: u64,
+    is_second_request: bool,
+    mem_limiter: &Arc<MemoryLimiter>,
+) -> u64 {
+    if is_second_request {
+        let rounded_offset = round_up_to_part_boundary(read_window_end_offset, request_range_start, part_size);
+        // NOTE: in the end of the request we still have up to "part_size" of unaccounted memory.
+        // For more accurate memory limiting we could reserve in "full parts", but that would make
+        // release more complicated. So accept this inaccuracy, and reserve only till `request_range_end`.
+        let rounded_offset = rounded_offset.min(request_range_end);
+
+        // If the rounded up window is greater, reserve the additional memory
+        if rounded_offset > read_window_end_offset {
+            let additional_bytes = rounded_offset - read_window_end_offset;
+            mem_limiter.reserve(crate::mem_limiter::BufferArea::Prefetch, additional_bytes);
+            rounded_offset
+        } else {
+            read_window_end_offset
+        }
+    } else {
+        read_window_end_offset
+    }
+}
+
 /// Creates a meta GetObject request with the specified range and sends received body parts via the returned [Stream].
 ///
 /// A [PrefetchReadError] is returned when something goes wrong in the underlying meta GetObject request.
+#[allow(clippy::too_many_arguments)]
 fn read_from_request<'a, Client: ObjectClient + 'a>(
     backpressure_limiter: &'a mut BackpressureLimiter,
     client: &'a Client,
     bucket: String,
     id: ObjectId,
     request_range: Range<u64>,
+    mem_limiter: Arc<MemoryLimiter>,
+    is_second_request: bool,
+    part_size: u64,
 ) -> impl Stream<Item = RequestReaderOutput<Client::ClientError>> + 'a {
     try_stream! {
         let mut request = client
@@ -417,7 +484,16 @@ fn read_from_request<'a, Client: ObjectClient + 'a>(
         let mut client_backpressure_handle = request.backpressure_handle()
             .expect("S3 client backpressure should always be enabled in Mountpoint")
             .clone();
-        client_backpressure_handle.ensure_read_window(backpressure_limiter.read_window_end_offset());
+
+        let initial_read_window_end_offset = reserve_up_to_part_boundary(
+            backpressure_limiter.read_window_end_offset(),
+            request_range.start,
+            request_range.end,
+            part_size,
+            is_second_request,
+            &mem_limiter,
+        );
+        client_backpressure_handle.ensure_read_window(initial_read_window_end_offset);
 
         pin_mut!(request);
         while let Some(next) = request.next().await {
@@ -450,7 +526,15 @@ fn read_from_request<'a, Client: ObjectClient + 'a>(
             //   This serves instead as the point where we react to the backpressure, and send signals to the S3 client.
             //   Instead, the backpressure controller or an async task could communicate directly with the client.
             if let Some(next_read_window_end_offset) = backpressure_limiter.wait_for_read_window_increment(next_offset).await? {
-                client_backpressure_handle.ensure_read_window(next_read_window_end_offset);
+                let adjusted_read_window_end_offset = reserve_up_to_part_boundary(
+                    next_read_window_end_offset,
+                    request_range.start,
+                    request_range.end,
+                    part_size,
+                    is_second_request,
+                    &mem_limiter,
+                );
+                client_backpressure_handle.ensure_read_window(adjusted_read_window_end_offset);
             }
         }
         trace!("request finished");

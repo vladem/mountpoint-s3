@@ -70,6 +70,7 @@ where
                 self.runtime.clone(),
                 backpressure_limiter,
                 config,
+                self.mem_limiter.clone(),
             );
             let span = debug_span!("prefetch", ?range);
             request.get_from_cache(range, part_queue_producer).instrument(span)
@@ -92,6 +93,7 @@ struct CachingRequest<Client: ObjectClient, Cache> {
     runtime: Runtime,
     backpressure_limiter: BackpressureLimiter,
     config: RequestTaskConfig,
+    mem_limiter: Arc<MemoryLimiter>,
 }
 
 impl<Client, Cache> CachingRequest<Client, Cache>
@@ -105,6 +107,7 @@ where
         runtime: Runtime,
         backpressure_limiter: BackpressureLimiter,
         config: RequestTaskConfig,
+        mem_limiter: Arc<MemoryLimiter>,
     ) -> Self {
         Self {
             client,
@@ -112,6 +115,7 @@ where
             runtime,
             backpressure_limiter,
             config,
+            mem_limiter,
         }
     }
 
@@ -221,6 +225,8 @@ where
             cache_key.clone(),
             first_read_window_end_offset,
             block_aligned_byte_range,
+            self.mem_limiter.clone(),
+            self.config.read_part_size as u64,
         );
 
         let mut part_composer = CachingPartComposer {
