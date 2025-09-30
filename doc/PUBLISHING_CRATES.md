@@ -11,7 +11,7 @@ We currently publish 5 crates:
   * [`mountpoint-s3-crt`](https://crates.io/crates/mountpoint-s3-crt)
   * [`mountpoint-s3-crt-sys`](https://crates.io/crates/mountpoint-s3-crt-sys)
 
-* Mountpoint fork of the [fuser](https://crates.io/crates/fuser) crate:  
+* Mountpoint fork of the [fuser](https://crates.io/crates/fuser) crate:
   * [`mountpoint-s3-fuser`](https://crates.io/crates/mountpoint-s3-fuser)
 
 * Core Mountpoint file system crate:
@@ -61,6 +61,7 @@ First, confirm that for each crate:
 
 * `CHANGELOG.md` lists the relevant changes since the latest released version,
 * `Cargo.toml` sets the version that you intend to publish.
+* Ensure that at least the minor version is bumped for each crate (e.g. `0.1.0` -> `0.2.0`), as releasing new patch versions may break consumers.
 
 If `CHANGELOG.md` does not report any entries since the latest release, and the latter matches the version in
 `Cargo.toml`, **the crate should not contain any changes and there should be no need to publish a new version**.
