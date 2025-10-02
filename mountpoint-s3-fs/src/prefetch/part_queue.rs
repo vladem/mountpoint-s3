@@ -99,13 +99,11 @@ impl<Client: ObjectClient> PartQueue<Client> {
     }
 
     /// Push a new [Part] onto the front of the queue
-    pub async fn push_front(&mut self, part: Part) -> Result<(), PrefetchReadError<Client::ClientError>> {
+    pub async fn push_front(&mut self, mut part: Part) -> Result<(), PrefetchReadError<Client::ClientError>> {
         assert!(!self.failed, "cannot use a PartQueue after failure");
 
         metrics::gauge!("prefetch.bytes_in_queue").increment(part.len() as f64);
-        // The backpressure controller is not aware of the parts from backwards seek,
-        // so we have to reserve memory for them here.
-        self.mem_limiter.reserve(BufferArea::Prefetch, part.len() as u64);
+        part.backwards_seek = true; // reads of `backward_seek` parts won't be reported to BackpressureController
         self.front_queue.push(part);
         Ok(())
     }

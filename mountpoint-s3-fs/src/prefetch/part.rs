@@ -10,6 +10,7 @@ pub struct Part {
     id: ObjectId,
     offset: u64,
     checksummed_bytes: ChecksummedBytes,
+    pub backwards_seek: bool,
 }
 
 impl Part {
@@ -18,6 +19,7 @@ impl Part {
             id,
             offset,
             checksummed_bytes,
+            backwards_seek: false,
         }
     }
 
@@ -41,6 +43,7 @@ impl Part {
             id: self.id.clone(),
             offset: self.offset + at as u64,
             checksummed_bytes: new_bytes,
+            backwards_seek: false,
         }
     }
 

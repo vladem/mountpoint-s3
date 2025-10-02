@@ -90,7 +90,13 @@ pub fn new_backpressure_controller(
     // Minimum window size multiplier as the scaling up and down won't work if the multiplier is 1.
     const MIN_WINDOW_SIZE_MULTIPLIER: usize = 2;
     let read_window_end_offset = config.request_range.start + config.initial_read_window_size as u64;
-    mem_limiter.reserve(BufferArea::Prefetch, config.initial_read_window_size as u64);
+    let part_size = 8 * 1024 * 1024;
+    let backawards_seek_window_size = 1 * 1024 * 1024; // 1 MB
+    assert!(
+        config.initial_read_window_size > backawards_seek_window_size
+        && part_size > backawards_seek_window_size
+    ); // we never reserve more than one part for backwards seek window (assume it for now)
+    mem_limiter.reserve(BufferArea::Prefetch, part_size as u64);
 
     let (read_window_updater, read_window_increment_queue) = unbounded();
     let read_window_increment_queue = ReadWindowIncrementQueue::new(read_window_increment_queue);
@@ -126,10 +132,41 @@ impl BackpressureController {
     /// will ensure that the read window size is enough to read this offset and that it is always close to `preferred_read_window_size`.
     pub async fn send_feedback<E>(&mut self, event: BackpressureFeedbackEvent) -> Result<(), PrefetchReadError<E>> {
         match event {
-            // Note, that this may come from a backwards seek, so offsets observed by this method are not necessarily ascending
             BackpressureFeedbackEvent::DataRead { offset, length } => {
+                // - Release `part_size` for part i only after we've consumed `backwards_window_size` of part i+1
+                // - no DataRead events when reading from backwards window
+                // - in the end of the request release full `part_size` (even if we had less data)
+                // - drop may need to release part if it is still reserved for backwards seek window
+                let first_req_range = 0..(1024 * 1024 + 128);
+                let part_size = 8 * 1024 * 1024;
+                let backawards_seek_window_size = 1 * 1024 * 1024; // 1 MB
                 self.next_read_offset = offset + length as u64;
-                self.mem_limiter.release(BufferArea::Prefetch, length as u64);
+
+                let prev_part_queue_start = (self.next_read_offset - length as u64 - backawards_seek_window_size).max(0);
+                let part_queue_start = (self.next_read_offset - backawards_seek_window_size).max(0); // start offset that we still keep in memory
+
+                if prev_part_queue_start < first_req_range.end && part_queue_start >= first_req_range.end {
+                    // just moved through the end of first request, special case accounting for unused extra memory reserved for first request
+
+                }
+                if part_queue_start < first_req_range.end {
+                    // release memory from first request, parts counted relative to first request start
+                    let prev_first_reserved_part = prev_part_queue_start.saturating_sub(first_req_range.start) / part_size;
+                    let first_reserved_part = part_queue_start.saturating_sub(first_req_range.start) / part_size;
+                    let parts_to_release = first_reserved_part - prev_first_reserved_part;
+                    if parts_to_release > 0 { // we've got some parts to release
+                        self.mem_limiter.release(BufferArea::Prefetch, parts_to_release * part_size);
+                    }
+                } else {
+                    // release memory from second request, parts counted relative to second request start
+                    let prev_first_reserved_part = prev_part_queue_start.saturating_sub(first_req_range.end) / part_size;
+                    let first_reserved_part = part_queue_start.saturating_sub(first_req_range.end) / part_size;
+                    let parts_to_release = first_reserved_part - prev_first_reserved_part;
+                    if parts_to_release > 0 { // we've got some parts to release
+                        self.mem_limiter.release(BufferArea::Prefetch, parts_to_release * part_size);
+                    }
+                }
+
                 let remaining_window = self.read_window_end_offset.saturating_sub(self.next_read_offset) as usize;
 
                 // Increment the read window only if the remaining window reaches some threshold i.e. half of it left.
@@ -271,6 +308,8 @@ impl Drop for BackpressureController {
             self.next_read_offset <= self.request_end_offset,
             "invariant: the next read offset should never be larger than the request end offset",
         );
+        // todo: handle proper release of what is left on drop
+        // drop must release the last part and probably the previous to last (note that one of them holds the backwards seek window)
         // Free up memory we have reserved for the read window.
         let remaining_window = self.read_window_end_offset.saturating_sub(self.next_read_offset);
         self.mem_limiter.release(BufferArea::Prefetch, remaining_window);
