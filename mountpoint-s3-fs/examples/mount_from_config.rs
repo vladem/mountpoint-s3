@@ -12,7 +12,11 @@ use mountpoint_s3_fs::{
         config::{FuseOptions, FuseSessionConfig, MountPoint},
         session::FuseSession,
     },
-    logging::{LoggingConfig, LoggingHandle, error_logger::FileErrorLogger, init_logging},
+    logging::{
+        LoggingConfig, LoggingHandle,
+        error_logger::{HttpErrorLogger, HttpErrorLoggerConfig},
+        init_logging,
+    },
     manifest::{ChannelConfig, Manifest, ManifestMetablock, ingest_manifest},
     memory::PagedPool,
     metrics::{self, MetricsSinkHandle},
@@ -60,8 +64,8 @@ struct ConfigOptions {
     throughput_config: ThroughputConfig,
     /// Directory where MP stores temporary files, such as cached metadata
     metadata_store_dir: String,
-    /// Directory where MP will create an event log
-    event_log_dir: String,
+    /// HTTP error logger configuration
+    error_logger: Option<ErrorLoggerConfig>,
     /// List of channels
     channels: Vec<ChannelConfig>,
     #[serde(default)]
@@ -328,17 +332,43 @@ struct Args {
     config: String,
 }
 
+/// Configuration for the error logger
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorLoggerConfig {
+    /// Maximum number of events to store in memory
+    max_events: Option<usize>,
+    /// HTTP server bind address (e.g., "127.0.0.1:8080" or "/tmp/mountpoint-errors.sock" for UDS)
+    bind_address: Option<String>,
+    /// Whether to use Unix Domain Socket (true) or TCP (false)
+    use_unix_socket: Option<bool>,
+}
+
+impl ErrorLoggerConfig {
+    fn to_http_config(&self) -> HttpErrorLoggerConfig {
+        HttpErrorLoggerConfig {
+            max_events: self.max_events.unwrap_or(1000),
+            bind_address: self
+                .bind_address
+                .clone()
+                .unwrap_or_else(|| "/tmp/mountpoint-s3-errors.sock".to_string()),
+            use_unix_socket: self.use_unix_socket.unwrap_or(true),
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // Parse command line arguments
     let args = Args::parse();
     // Read the config
     let config = load_config(&args.config).context("Failed to load config")?;
     // Set up the error logger
-    let error_logger = FileErrorLogger::new(&config.event_log_dir, || {
-        // trigger graceful shutdown (with umount) by sending a signal to self
-        signal::kill(Pid::this(), Signal::SIGINT).expect("kill must succeed");
-    })
-    .context("Failed to create an event log")?;
+    let error_logger_config = config
+        .error_logger
+        .as_ref()
+        .map(|c| c.to_http_config())
+        .unwrap_or_default();
+    let error_logger = HttpErrorLogger::new(error_logger_config).context("Failed to create HTTP error logger")?;
     // Set up logging
     let (_logging, _metrics) = setup_logging(&config).context("Failed to setup logging")?;
     // Process manifests if needed

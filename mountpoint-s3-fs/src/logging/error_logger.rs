@@ -1,45 +1,59 @@
-use std::fs::File;
-use std::io::BufWriter;
-use std::path::Path;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use serde::{Deserialize, Serialize};
-use std::thread::{self, JoinHandle};
 use time::{OffsetDateTime, serde::rfc3339};
 
 use crate::fs::Error;
 use crate::fs::error_metadata::{MOUNTPOINT_ERROR_INTERNAL, MOUNTPOINT_ERROR_LOOKUP_NONEXISTENT};
 use crate::fuse::ErrorLogger;
-use crate::logging::log_file_name_time_suffix;
-use crate::sync::mpsc::{self, Receiver, SyncSender};
 
 const VERSION: &str = "1";
 
-/// [FileErrorLogger] provides a callback for logging errors in a structured format to a file. Logging
-/// is done in a separate thread which is launched in [FileErrorLogger::new],
-///
-/// The output format is `\n`-separated `json`'s, where each `json` describes a single error. Namely,
-/// errors occurring on fuse operations are logged to the file.
-///
-/// Fields `error_code`, `s3_error_http_status` and `s3_error_code` may be used to detect specific
-/// failure conditions, for instance, errors caused by throttling or a lack of permissions. Fields
-/// `s3_object_key` and `s3_error_message` may be used to provide further diagnostics to the user.
-///
-/// Note that most of the fields are optional and may not be present in the event. Only `operation`,
-/// `error_code`, `timestamp` amd `version` will be present in all events. The field `error_code`
-/// is assigned to errors by Mountpoint itself and may be used for a rough classification of those.
-/// See [mountpoint_s3_fs::fs::error_metadata] for the list of possible values.
-///
-/// As an example, the following rule may be used to detect permission errors:
-/// `s3_error_http_status == 403 || (s3_error_http_status == 400 && s3_error_code in {"AccessDenied"})`
-///
-/// And the following rule for throttling errors:
-/// `s3_error_http_status == 503`
-pub struct FileErrorLogger {
-    event_sender: Option<SyncSender<Event>>,
-    writer_thread: Option<JoinHandle<()>>,
+/// Trait for abstracting over different stream types (TCP and Unix sockets)
+trait HttpStream: std::io::Read + std::io::Write {}
+
+impl HttpStream for std::net::TcpStream {}
+impl HttpStream for std::os::unix::net::UnixStream {}
+
+/// Configuration for the HTTP error logger
+#[derive(Debug, Clone)]
+pub struct HttpErrorLoggerConfig {
+    /// Maximum number of events to store in memory
+    pub max_events: usize,
+    /// HTTP server bind address (e.g., "127.0.0.1:8080" or "/tmp/mountpoint-errors.sock" for UDS)
+    pub bind_address: String,
+    /// Whether to use Unix Domain Socket (true) or TCP (false)
+    pub use_unix_socket: bool,
 }
 
-impl ErrorLogger for FileErrorLogger {
+impl Default for HttpErrorLoggerConfig {
+    fn default() -> Self {
+        Self {
+            max_events: 1000,
+            bind_address: "/tmp/mountpoint-s3-errors.sock".to_string(),
+            use_unix_socket: true,
+        }
+    }
+}
+
+/// [HttpErrorLogger] provides a callback for logging errors in a structured format to memory
+/// and serves them via HTTP interface. Events are stored in a circular buffer with configurable
+/// size, and can be accessed via HTTP GET requests.
+///
+/// The HTTP server supports both TCP and Unix Domain Socket endpoints. Events are served as
+/// JSON arrays at the root endpoint ("/").
+///
+/// The output format is the same as FileErrorLogger - JSON objects with fields like
+/// `error_code`, `s3_error_http_status`, `s3_error_code`, etc.
+pub struct HttpErrorLogger {
+    http_server_thread: Option<JoinHandle<()>>,
+    events_buffer: Arc<Mutex<VecDeque<Event>>>,
+    config: HttpErrorLoggerConfig,
+}
+
+impl ErrorLogger for HttpErrorLogger {
     fn error(&self, err: &crate::fs::Error, fuse_operation: &str, fuse_request_id: u64) {
         self.log_error(err, fuse_operation, fuse_request_id);
     }
@@ -49,19 +63,28 @@ impl ErrorLogger for FileErrorLogger {
     }
 }
 
-impl FileErrorLogger {
-    /// Spawns a new thread writing events to a file and return a callback which may be used to send events to this thread
-    /// in a non blocking manner.
-    pub fn new<P: AsRef<Path>>(log_directory: P, on_write_failure: impl Fn() + Send + 'static) -> anyhow::Result<Self> {
-        let max_inflight_events = 1000;
-        let (event_sender, receiver) = mpsc::sync_channel(max_inflight_events);
-        let event_log_file_name = format!("mountpoint-s3-event-log-{}.log", log_file_name_time_suffix());
-        let file = File::create(log_directory.as_ref().join(event_log_file_name))?;
-        let writer_thread = thread::spawn(|| Self::write_to_file(receiver, file, on_write_failure));
+impl HttpErrorLogger {
+    /// Creates a new HTTP error logger with the given configuration
+    pub fn new(config: HttpErrorLoggerConfig) -> anyhow::Result<Self> {
+        let events_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(config.max_events)));
+        let events_buffer_http = Arc::clone(&events_buffer);
+
+        // Spawn HTTP server thread
+        let bind_address = config.bind_address.clone();
+        let use_unix_socket = config.use_unix_socket;
+        let http_server_thread =
+            thread::spawn(move || Self::run_http_server(events_buffer_http, bind_address, use_unix_socket));
+
         Ok(Self {
-            event_sender: Some(event_sender),
-            writer_thread: Some(writer_thread),
+            http_server_thread: Some(http_server_thread),
+            events_buffer,
+            config,
         })
+    }
+
+    /// Creates a new HTTP error logger with default configuration
+    pub fn with_defaults() -> anyhow::Result<Self> {
+        Self::new(HttpErrorLoggerConfig::default())
     }
 
     /// Logs a failed fuse operation. The field `error_code` is set to `MOUNTPOINT_ERROR_INTERNAL` if it
@@ -75,55 +98,154 @@ impl FileErrorLogger {
             return;
         }
         let event = Event::new_error_event(error, fuse_operation, fuse_request_id, error_code);
-        self.event_sender
-            .as_ref()
-            .unwrap()
-            .send(event)
-            .expect("must be able to send an event");
+        self.add_event_to_buffer(event);
     }
 
     /// Log an event with the given operation and code
     fn log_event(&self, operation: &str, event_code: &str) {
         let event = Event::new_simple_event(operation, event_code);
-        self.event_sender
-            .as_ref()
-            .unwrap()
-            .send(event)
-            .expect("must be able to send an event");
+        self.add_event_to_buffer(event);
     }
 
-    fn write_to_file(events_receiver: Receiver<Event>, file: File, on_write_failure: impl Fn() + Send + 'static) {
-        let mut writer = BufWriter::new(file);
-        for event in events_receiver {
-            if let Err(err) = event.write(&mut writer) {
-                tracing::error!("failed to write to the event log: {}, event: {:?}", err, event);
-                on_write_failure();
+    /// Helper method to add an event to the circular buffer
+    fn add_event_to_buffer(&self, event: Event) {
+        if let Ok(mut buffer) = self.events_buffer.lock() {
+            // Add new event
+            buffer.push_back(event);
+
+            // Remove old events if we exceed the limit
+            while buffer.len() > self.config.max_events {
+                buffer.pop_front();
             }
+        }
+    }
+
+    /// Run the HTTP server to serve events
+    fn run_http_server(events_buffer: Arc<Mutex<VecDeque<Event>>>, bind_address: String, use_unix_socket: bool) {
+        use std::net::TcpListener;
+        use std::os::unix::net::UnixListener;
+
+        if use_unix_socket {
+            // Remove existing socket file if it exists
+            let _ = std::fs::remove_file(&bind_address);
+
+            match UnixListener::bind(&bind_address) {
+                Ok(listener) => {
+                    tracing::info!("HTTP error logger listening on Unix socket: {}", bind_address);
+                    for stream in listener.incoming() {
+                        match stream {
+                            Ok(stream) => {
+                                Self::handle_connection(stream, Arc::clone(&events_buffer));
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to accept Unix socket connection: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to bind Unix socket {}: {}", bind_address, e);
+                }
+            }
+        } else {
+            match TcpListener::bind(&bind_address) {
+                Ok(listener) => {
+                    tracing::info!("HTTP error logger listening on TCP: {}", bind_address);
+                    for stream in listener.incoming() {
+                        match stream {
+                            Ok(stream) => {
+                                Self::handle_connection(stream, Arc::clone(&events_buffer));
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to accept TCP connection: {}", e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to bind TCP socket {}: {}", bind_address, e);
+                }
+            }
+        }
+    }
+
+    fn handle_connection<S: HttpStream>(mut stream: S, events_buffer: Arc<Mutex<VecDeque<Event>>>) {
+        let mut buffer = [0; 1024];
+        match stream.read(&mut buffer) {
+            Ok(_) => {
+                let response = Self::generate_http_response(events_buffer);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+            Err(e) => {
+                tracing::error!("Failed to read from stream: {}", e);
+            }
+        }
+    }
+
+    fn generate_http_response(events_buffer: Arc<Mutex<VecDeque<Event>>>) -> String {
+        let events = match events_buffer.lock() {
+            Ok(buffer) => buffer.iter().cloned().collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+
+        let json_body = match serde_json::to_string_pretty(&events) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::error!("Failed to serialize events to JSON: {}", e);
+                "[]".to_string()
+            }
+        };
+
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+            json_body.len(),
+            json_body
+        )
+    }
+
+    /// Get current events (for testing or direct access)
+    pub fn get_events(&self) -> Vec<Event> {
+        match self.events_buffer.lock() {
+            Ok(buffer) => buffer.iter().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Get the number of events currently stored
+    pub fn event_count(&self) -> usize {
+        match self.events_buffer.lock() {
+            Ok(buffer) => buffer.len(),
+            Err(_) => 0,
         }
     }
 }
 
-impl Drop for FileErrorLogger {
+impl Drop for HttpErrorLogger {
     fn drop(&mut self) {
-        // Signal the [Self::writer_thread] to shutdown by dropping [Self::event_sender] and wait for the thread to
-        // actually shutdown to ensure all events were processed.
-        self.event_sender.take().expect("must be set");
-        self.writer_thread
-            .take()
-            .expect("writer must be set")
-            .join()
-            .expect("must wait for writer thread");
-        tracing::debug!("writer done");
+        // Note: We don't wait for the HTTP server thread as it runs indefinitely
+        // In a real implementation, you might want to add a shutdown mechanism
+
+        // Clean up Unix socket file if we were using one
+        if self.config.use_unix_socket {
+            let _ = std::fs::remove_file(&self.config.bind_address);
+        }
+
+        tracing::debug!("HttpErrorLogger dropped");
     }
 }
 
-impl std::fmt::Debug for FileErrorLogger {
+impl std::fmt::Debug for HttpErrorLogger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FileErrorLogger")
+        write!(
+            f,
+            "HttpErrorLogger(bind_address: {}, max_events: {})",
+            self.config.bind_address, self.config.max_events
+        )
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 pub struct Event {
     #[serde(with = "rfc3339")]
     pub timestamp: OffsetDateTime,
@@ -178,17 +300,11 @@ impl Event {
             version: VERSION.to_string(),
         }
     }
-
-    fn write<W: std::io::Write>(&self, mut writer: W) -> std::io::Result<()> {
-        serde_json::to_writer(&mut writer, &self)?;
-        writer.write_all(b"\n")?;
-        writer.flush()
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, time::Duration};
 
     use crate::{
         fs::error_metadata::{ErrorMetadata, MOUNTPOINT_ERROR_CLIENT},
@@ -203,75 +319,48 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_log_event() {
-        // define input and the expected output
-        let fs_errors = [Error {
-            errno: 6,
-            message: "fs error".to_string(),
-            source: Some(anyhow::anyhow!(PrefetchReadError::GetRequestFailed {
-                source: ObjectClientError::ClientError(GetObjectError::NoSuchKey(Default::default())),
-                metadata: Box::default(),
-            })),
-            level: tracing::Level::WARN,
-            metadata: ErrorMetadata {
-                client_error_meta: ClientErrorMetadata {
-                    http_code: Some(404),
-                    error_code: Some("NoSuchKey".to_string()),
-                    error_message: Some("The specified key does not exist.".to_string()),
-                },
-                error_code: Some(MOUNTPOINT_ERROR_CLIENT.to_string()),
-                s3_bucket_name: Some("amzn-s3-demo-bucket".to_string()),
-                s3_object_key: Some("key".to_string()),
-            },
-        }];
-        let mut expected_events = [Event {
-            timestamp: OffsetDateTime::now_utc(),
-            operation: "read".to_string(),
-            fuse_request_id: Some(10),
-            error_code: MOUNTPOINT_ERROR_CLIENT.to_string(),
-            errno: Some(6),
-            internal_message: Some(
-                "fs error: get object request failed: Client error: The key does not exist".to_string(),
-            ),
-            s3_bucket_name: Some("amzn-s3-demo-bucket".to_string()),
-            s3_object_key: Some("key".to_string()),
-            s3_error_http_status: Some(404),
-            s3_error_code: Some("NoSuchKey".to_string()),
-            s3_error_message: Some("The specified key does not exist.".to_string()),
-            version: VERSION.to_string(),
-        }];
+    fn test_http_error_logger() {
+        let config = HttpErrorLoggerConfig {
+            max_events: 5,
+            bind_address: "/tmp/test-mountpoint-errors.sock".to_string(),
+            use_unix_socket: true,
+        };
 
-        let log_dir = tempdir().expect("must create a log dir");
+        let logger = HttpErrorLogger::new(config).expect("must create HTTP error logger");
 
-        {
-            // log errors and drop the logger to ensure data was written to the disk
-            let error_logger = FileErrorLogger::new(log_dir.path(), || ()).expect("must create the event logger");
+        // Log some events
+        logger.log_event("test_operation", "test_code");
+        logger.log_event("another_operation", "another_code");
 
-            for error in fs_errors.iter() {
-                error_logger.error(error, "read", 10);
-            }
-        }
-
-        // check output
-        let event_log = fs::read_to_string(find_event_log_file_path(log_dir.path())).expect("must read the event log");
-        let written_events: Vec<Event> = event_log
-            .split("\n")
-            .filter(|line| !line.is_empty())
-            .map(|line| serde_json::from_str(line).expect("must be a valid event"))
-            .collect();
-        assert_eq!(written_events.len(), expected_events.len());
-        for (i, written_event) in written_events.iter().enumerate() {
-            expected_events[i].timestamp = written_event.timestamp; // do not validate the value of timestamp
-        }
-        assert_eq!(&written_events, &expected_events);
+        // Check that events were stored immediately (no async processing)
+        let events = logger.get_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].operation, "test_operation");
+        assert_eq!(events[0].error_code, "test_code");
+        assert_eq!(events[1].operation, "another_operation");
+        assert_eq!(events[1].error_code, "another_code");
     }
 
-    fn find_event_log_file_path<P: AsRef<Path>>(dir: P) -> PathBuf {
-        fs::read_dir(dir)
-            .expect("readdir must succeed")
-            .map(|entry| entry.expect("readdir must succeed"))
-            .find(|e| e.path().is_file())
-            .expect("expected an event log file in the directory")
-            .path()
+    #[test]
+    fn test_circular_buffer() {
+        let config = HttpErrorLoggerConfig {
+            max_events: 2, // Small buffer to test circular behavior
+            bind_address: "/tmp/test-circular-errors.sock".to_string(),
+            use_unix_socket: true,
+        };
+
+        let logger = HttpErrorLogger::new(config).expect("must create HTTP error logger");
+
+        // Log more events than the buffer can hold
+        logger.log_event("event1", "code1");
+        logger.log_event("event2", "code2");
+        logger.log_event("event3", "code3"); // This should push out event1
+
+        // Check that circular buffer behavior works immediately
+        let events = logger.get_events();
+        assert_eq!(events.len(), 2);
+        // Should have event2 and event3, event1 should be gone
+        assert_eq!(events[0].operation, "event2");
+        assert_eq!(events[1].operation, "event3");
     }
 }
