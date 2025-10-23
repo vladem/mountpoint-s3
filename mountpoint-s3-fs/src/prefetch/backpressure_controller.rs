@@ -130,7 +130,7 @@ pub fn new_backpressure_controller(
 }
 
 impl BackpressureController {
-    fn process_event(&mut self, event: BackpressureFeedbackEvent) {
+    fn process_event(&mut self, event: BackpressureFeedbackEvent, request_start: u64, part_size: u64) {
         match event {
             // Note, that this may come from a backwards seek, so offsets observed by this method are not necessarily ascending
             BackpressureFeedbackEvent::DataRead { offset, length } => {
@@ -146,8 +146,10 @@ impl BackpressureController {
                 {
                     let new_read_window_end_offset = self
                         .next_read_offset
-                        .saturating_add(self.preferred_read_window_size as u64)
-                        .min(self.request_end_offset);
+                        .saturating_add(self.preferred_read_window_size as u64);
+                    let new_read_window_end_offset =
+                        Self::round_up_to_part_boundary(new_read_window_end_offset, request_start, part_size)
+                            .min(self.request_end_offset);
                     // We can skip if the new `read_window_end_offset` is less than or equal to the current one, this
                     // could happen after the read window is scaled down.
                     if new_read_window_end_offset <= self.read_window_end_offset {
@@ -228,6 +230,28 @@ impl BackpressureController {
     fn finished(&self) -> bool {
         self.read_window_end_offset == self.request_end_offset
     }
+
+    /// Round up `read_window_end` to next part boundary (relative to request start).
+    ///
+    /// This function ensures that read window end offsets are aligned to part boundaries for the second request,
+    /// which helps optimize memory usage.
+    ///
+    /// If the `read_window_end` is before the second request start or `align_read_window` is false, it returns the `read_window_end` unchanged.
+    ///
+    /// Note: window excludes the last byte, denoted by `read_window_end`.
+    fn round_up_to_part_boundary(read_window_end: u64, request_start: u64, part_size: u64) -> u64 {
+        if read_window_end > request_start {
+            let relative_end_offset = read_window_end - request_start;
+            if !relative_end_offset.is_multiple_of(part_size) {
+                let aligned_relative_offset = part_size * (relative_end_offset / part_size + 1);
+                request_start + aligned_relative_offset
+            } else {
+                read_window_end
+            }
+        } else {
+            read_window_end
+        }
+    }
 }
 
 impl Drop for BackpressureController {
@@ -253,6 +277,8 @@ impl BackpressureLimiter {
     pub async fn wait_for_read_window_increment<E>(
         &mut self,
         next_request_offset: u64,
+        request_start: u64,
+        part_size: u64,
     ) -> Result<Option<u64>, PrefetchReadError<E>> {
         let prev_read_window_end_offset = self.controller.read_window_end_offset;
         loop {
@@ -271,7 +297,7 @@ impl BackpressureLimiter {
                 break;
             };
             // this call updates read_window_end_offset if the reader advanced far enough (at least half of read window must be not read yet)
-            self.controller.process_event(event);
+            self.controller.process_event(event, request_start, part_size);
         }
         if prev_read_window_end_offset < self.controller.read_window_end_offset {
             Ok(Some(self.controller.read_window_end_offset))
@@ -356,7 +382,7 @@ mod tests {
 
         // OK, back to basics. Just reproduce what happened, verify it passes after the fix.
         let backpressure_config = BackpressureConfig {
-            initial_read_window_size: 1 * MIB,
+            initial_read_window_size: 8 * MIB,
             min_read_window_size: 8 * MIB,
             max_read_window_size: 2 * GIB,
             read_window_size_multiplier: 2,
@@ -367,8 +393,7 @@ mod tests {
             new_backpressure_limiter_for_test(backpressure_config);
 
         block_on(async {
-            #[allow(clippy::identity_op)]
-            let expected_offset = 1 * MIB as u64;
+            let expected_offset = 8 * MIB as u64;
             assert_eq!(
                 backpressure_limiter.read_window_end_offset(),
                 expected_offset,
@@ -383,38 +408,41 @@ mod tests {
                 })
                 .await;
             backpressure_notifier
-                .send_feedback(BackpressureFeedbackEvent::PartQueueStall)
-                .await;
-            backpressure_notifier
                 .send_feedback(BackpressureFeedbackEvent::DataRead {
                     offset: (1 * MIB) as u64,
-                    length: 1 * MIB,
+                    length: 2 * MIB,
                 })
                 .await;
             backpressure_notifier
                 .send_feedback(BackpressureFeedbackEvent::DataRead {
-                    offset: (2 * MIB) as u64,
-                    length: 8 * MIB,
-                })
-                .await;
-            backpressure_notifier
-                .send_feedback(BackpressureFeedbackEvent::DataRead {
-                    offset: (10 * MIB) as u64,
-                    length: 4 * MIB,
+                    offset: (3 * MIB) as u64,
+                    length: 2 * MIB,
                 })
                 .await;
 
             let curr_offset = backpressure_limiter
-                .wait_for_read_window_increment::<MockClientError>(0)
+                .wait_for_read_window_increment::<MockClientError>(0, 0, (8 * MIB) as u64)
                 .await
                 .expect("should return OK as we have new values to increment before channels are closed")
                 .expect("value should change as we sent increments");
             assert_eq!(
-                18 * MIB as u64,
+                16 * MIB as u64,
                 curr_offset,
                 "expected offset did not match offset reported by limiter",
             );
         });
+    }
+
+    #[test_case(500, 1000, 100, 500; "offset before second request start")]
+    #[test_case(1000, 1000, 512, 1000; "offset at second request start")]
+    #[test_case(1500, 1000, 512, 1512; "offset after second request start, needs rounding up")]
+    #[test_case(2024, 1000, 512, 2024; "offset after second request start, already aligned")]
+    #[test_case(1001, 1000, 512, 1512; "offset just after second request start, needs rounding up")]
+    #[test_case(1512, 1000, 512, 1512; "offset exactly at part boundary")]
+    #[test_case(1513, 1000, 512, 2024; "offset just past part boundary")]
+    fn test_round_up_to_part_boundary(offset: u64, second_req_start: u64, part_size: u64, expected: u64) {
+        let result = BackpressureController::round_up_to_part_boundary(offset, second_req_start, part_size);
+        assert_eq!(result, expected);
     }
 
     fn new_backpressure_limiter_for_test(

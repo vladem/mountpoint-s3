@@ -375,7 +375,7 @@ pub fn read_from_client_stream<'a, Client: ObjectClient + Clone + 'a>(
             //   1st req start  increment threshold   2d req start             2d req window end      2d req end (object size)
             //                                        1st req end
             //                                        1st req window end
-            backpressure_limiter.wait_for_read_window_increment(range.start()).await?;
+            backpressure_limiter.wait_for_read_window_increment(range.start(), range.start(), client.read_part_size() as u64).await?;
 
             // TODO: We currently wait for the first request data to be consumed
             //       before starting the request for the remainder of the object.
@@ -449,7 +449,7 @@ fn read_from_request<'a, Client: ObjectClient + 'a>(
             //   It does not make sense to 'block' here. In reality, we don't actually block here anyway.
             //   This serves instead as the point where we react to the backpressure, and send signals to the S3 client.
             //   Instead, the backpressure controller or an async task could communicate directly with the client.
-            if let Some(next_read_window_end_offset) = backpressure_limiter.wait_for_read_window_increment(next_offset).await? {
+            if let Some(next_read_window_end_offset) = backpressure_limiter.wait_for_read_window_increment(next_offset, request_range.start, client.read_part_size() as u64).await? {
                 client_backpressure_handle.ensure_read_window(next_read_window_end_offset);
             }
         }

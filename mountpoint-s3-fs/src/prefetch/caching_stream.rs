@@ -157,7 +157,7 @@ where
 
                     if let Err(e) = self
                         .backpressure_limiter
-                        .wait_for_read_window_increment(block_offset)
+                        .wait_for_read_window_increment(block_offset, range.start(), block_size)
                         .await
                     {
                         part_queue_producer.push(Err(e));
@@ -197,10 +197,12 @@ where
     ) {
         let bucket = &self.config.bucket;
         let cache_key = &self.config.object_id;
+        // TODO: is there always a reservation for this window end? works because block_size == initial_read_window_size?
         let first_read_window_end_offset = self.config.range.start() + self.config.initial_read_window_size as u64;
         let block_size = self.cache.block_size();
         assert!(block_size > 0);
 
+        // TODO: range always ends at the end of the object, why do we align here?
         // Always request a range aligned with block boundaries (or to the end of the object).
         let start_offset = block_range.start * block_size;
         let end_offset = (block_range.end * block_size).min(range.object_size() as u64);
