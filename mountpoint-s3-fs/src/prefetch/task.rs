@@ -2,8 +2,8 @@ use futures::future::RemoteHandle;
 use mountpoint_s3_client::ObjectClient;
 
 use super::PrefetchReadError;
-use super::backpressure_controller::BackpressureController;
 use super::backpressure_controller::BackpressureFeedbackEvent::{DataRead, PartQueueStall};
+use super::backpressure_controller::BackpressureNotifier;
 use super::part::Part;
 use super::part_queue::PartQueue;
 use super::part_stream::RequestRange;
@@ -17,7 +17,7 @@ pub struct RequestTask<Client: ObjectClient> {
     remaining: usize,
     range: RequestRange,
     part_queue: PartQueue<Client>,
-    backpressure_controller: BackpressureController,
+    backpressure_notifier: BackpressureNotifier,
 }
 
 impl<Client: ObjectClient> RequestTask<Client> {
@@ -25,14 +25,14 @@ impl<Client: ObjectClient> RequestTask<Client> {
         task_handle: RemoteHandle<()>,
         range: RequestRange,
         part_queue: PartQueue<Client>,
-        backpressure_controller: BackpressureController,
+        backpressure_notifier: BackpressureNotifier,
     ) -> Self {
         Self {
             _task_handle: task_handle,
             remaining: range.len(),
             range,
             part_queue,
-            backpressure_controller,
+            backpressure_notifier,
         }
     }
 
@@ -52,19 +52,19 @@ impl<Client: ObjectClient> RequestTask<Client> {
         self.remaining -= part.len();
 
         // We read some data out of the part queue so the read window should be moved
-        self.backpressure_controller
+        self.backpressure_notifier
             .send_feedback(DataRead {
                 offset: part.offset(),
                 length: part.len(),
             })
-            .await?;
+            .await;
 
         let next_offset = part.offset() + part.len() as u64;
         let remaining_in_queue = self.available_offset().saturating_sub(next_offset) as usize;
         // If the part queue is empty it means we are reading faster than the task could prefetch,
         // so we should use larger window for the task.
         if remaining_in_queue == 0 {
-            self.backpressure_controller.send_feedback(PartQueueStall).await?;
+            self.backpressure_notifier.send_feedback(PartQueueStall).await;
         }
 
         Ok(part)
@@ -92,6 +92,6 @@ impl<Client: ObjectClient> RequestTask<Client> {
     }
 
     pub fn read_window_end_offset(&self) -> u64 {
-        self.backpressure_controller.read_window_end_offset()
+        self.backpressure_notifier.read_window_end_offset()
     }
 }
