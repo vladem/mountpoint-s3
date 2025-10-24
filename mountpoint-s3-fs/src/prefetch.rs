@@ -240,6 +240,16 @@ where
     next_request_offset: u64,
     size: u64,
     mem_limiter: Arc<MemoryLimiter>,
+    /// A conservative memory reservation to prevent exceeding the memory limit
+    /// when handling a large number of file handles. This accounts for:
+    ///
+    /// - Memory used by the backward seek window.
+    /// - Memory used by data returned by the CRT ahead of the read window's end
+    ///   (rounded up to the nearest multiple of `part_size`).
+    ///
+    /// Note: This reservation is **in addition to** the one made in
+    /// [`PartQueue::push_front`].
+    additional_mem_reservation: u64,
 }
 
 impl<Client> PrefetchGetObject<Client>
@@ -256,11 +266,12 @@ where
         mem_limiter: Arc<MemoryLimiter>,
     ) -> Self {
         let max_backward_seek_distance = config.max_backward_seek_distance as usize;
-        // a conservative memory reservation to avoid violating the memory limit with the large number of file handles
-        // note that this reservation is done in addition to the one in [PartQueue::push_front]
         let seek_window_reservation =
             Self::seek_window_reservation(part_stream.client().read_part_size(), max_backward_seek_distance);
-        mem_limiter.reserve(BufferArea::Prefetch, seek_window_reservation);
+        let rounded_up_data_reservation = part_stream.client().read_part_size() as u64;
+        let additional_mem_reservation = seek_window_reservation + rounded_up_data_reservation;
+        mem_limiter.reserve(BufferArea::Prefetch, additional_mem_reservation);
+
         PrefetchGetObject {
             part_stream,
             config,
@@ -274,6 +285,7 @@ where
             object_id,
             size,
             mem_limiter,
+            additional_mem_reservation,
         }
     }
 
@@ -512,11 +524,8 @@ where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        let seek_window_reservation = Self::seek_window_reservation(
-            self.part_stream.client().read_part_size(),
-            self.backward_seek_window.max_size(),
-        );
-        self.mem_limiter.release(BufferArea::Prefetch, seek_window_reservation);
+        self.mem_limiter
+            .release(BufferArea::Prefetch, self.additional_mem_reservation);
         self.record_contiguous_read_metric();
     }
 }
