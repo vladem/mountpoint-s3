@@ -156,7 +156,8 @@ impl<'a> Request<'a> {
             }
             // Any operation is invalid before initialization
             _ if !se.initialized.load(Ordering::SeqCst) => {
-                warn!("Ignoring FUSE operation before init: {}", self.request);
+                warn!("Ignoring FUSE operation before init (but next one will work!): {}", self.request);
+                se.initialized.store(true, Ordering::SeqCst);
                 return Err(Errno::EIO);
             }
             // Filesystem destroyed

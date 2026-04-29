@@ -1,10 +1,13 @@
 // An example script showing usage of FUSE file descriptor as a mount point.
+// The mount helper keeps the FUSE fd open and relaunches Mountpoint whenever it stops,
+// preserving the mount across Mountpoint restarts.
 //
 // Example usage:
 // $ go build ./examples/fuse-fd-mount-point/mounthelper.go
 // $ sudo /sbin/setcap 'cap_sys_admin=ep' ./mounthelper # `mount` syscall requires `CAP_SYS_ADMIN`, alternatively, `mounthelper` can be run as root
 // $ ./mounthelper -mountpoint /tmp/mountpoint -bucket bucketname
 // $ # Mountpoint mounted at /tmp/mountpoint until `mounthelper` is terminated with ctrl+c.
+// $ # If Mountpoint exits, it will be automatically relaunched using the same FUSE fd.
 package main
 
 import (
@@ -36,15 +39,11 @@ func main() {
 		log.Panicf("Failed to open /dev/fuse: %v\n", err)
 	}
 
-	// Ensure to close the file descriptor in case of an error, if there are no errors,
-	// the file descriptor will be closed and `closeFd` will set to `false`.
-	closeFd := true
+	// Close the fd when the helper exits.
 	defer func() {
-		if closeFd {
-			err := syscall.Close(fd)
-			if err != nil {
-				log.Panicf("Failed to close fd on parent: %v\n", err)
-			}
+		err := syscall.Close(fd)
+		if err != nil {
+			log.Printf("Failed to close fd: %v\n", err)
 		}
 	}()
 
@@ -73,7 +72,7 @@ func main() {
 		log.Panicf("Failed to call mount syscall: %v\n", err)
 	}
 
-	// 3. Define and defer call to `unmount` syscall, to be invoked once script terminates
+	// 3. Define and defer call to `unmount` syscall, to be invoked once the helper terminates
 	defer func() {
 		err := syscall.Unmount(*mountPoint, 0)
 		if err != nil {
@@ -83,39 +82,47 @@ func main() {
 		}
 	}()
 
-	// 4. Spawn Mountpoint with the fd
-	mountpointCmd := exec.Command("./target/release/mount-s3",
-		*bucket,
-		fmt.Sprintf("/dev/fd/%d", fd),
-		// Other mount options can be added here
-		"--foreground",
-		"--prefix=some_s3_prefix/",
-		"--allow-delete",
-		// Enable verbose logs for debugging
-		// "--debug",
-		// "--debug-crt",
-	)
-	mountpointCmd.Stdout = os.Stdout
-	mountpointCmd.Stderr = os.Stderr
-	err = mountpointCmd.Start()
-	if err != nil {
-		log.Panicf("Failed to start Mountpoint: %v\n", err)
+	// 4. Listen for termination signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	// 5. Launch Mountpoint in a loop, restarting it whenever it exits.
+	//    The FUSE fd stays open in this process, so the mount remains valid across restarts.
+	for {
+		mountpointCmd := exec.Command("./target/release/mount-s3",
+			*bucket,
+			fmt.Sprintf("/dev/fd/%d", fd),
+			// Other mount options can be added here
+			"--foreground",
+			"--allow-delete",
+			// Enable verbose logs for debugging
+			// "--debug",
+			// "--debug-crt",
+		)
+		mountpointCmd.Stdout = os.Stdout
+		mountpointCmd.Stderr = os.Stderr
+		err = mountpointCmd.Start()
+		if err != nil {
+			log.Panicf("Failed to start Mountpoint: %v\n", err)
+		}
+
+		// Wait for either Mountpoint to exit or a termination signal.
+		exited := make(chan error, 1)
+		go func() {
+			exited <- mountpointCmd.Wait()
+		}()
+
+		select {
+		case <-stop:
+			// Helper received a signal — kill Mountpoint and exit.
+			log.Print("Received termination signal, shutting down")
+			mountpointCmd.Process.Signal(syscall.SIGTERM)
+			<-exited
+			// Deferred unmount and fd close will run on return.
+			return
+		case err := <-exited:
+			// Mountpoint exited on its own — relaunch it.
+			log.Printf("Mountpoint exited: %v. Relaunching...\n", err)
+		}
 	}
-
-	// 4. Close fd on parent
-	err = syscall.Close(fd)
-	if err != nil {
-		log.Panicf("Failed to close fd on parent: %v\n", err)
-	}
-	// As we explicitly closed it, no need for `defer`red close to happen.
-	closeFd = false
-
-	done := make(chan os.Signal, 1)
-	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
-
-	log.Print("Filesystem mounted, waiting for ctrl+c signal to terminate")
-	<-done
-
-	// 5. Unmounting will happen here due to `defer` in step 3.
-	mountpointCmd.Wait()
 }
