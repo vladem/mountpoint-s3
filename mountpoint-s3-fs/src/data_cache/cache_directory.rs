@@ -99,43 +99,76 @@ impl ManagedCacheDir {
     /// and then spawns a detached background thread to clean up the old cache folder.
     fn remove_in_background(&self) -> io::Result<()> {
         let exists = self.mountpoint_cache_path.try_exists()?;
-        if !exists {
-            // Nothing to do
-            return Ok(());
+        if exists {
+            let epoch_ns = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let renamed_cache_path = self.mountpoint_cache_path.with_file_name(format!(
+                "{}{}",
+                ManagedCacheDir::MOUNTPOINT_OLD_CACHE_DIR_PREFIX,
+                epoch_ns
+            ));
+
+            tracing::debug!(
+                cache_subdirectory = ?self.mountpoint_cache_path,
+                renamed_cache_subdirectory = ?renamed_cache_path,
+                "renaming the cache sub-directory to clean up in a background thread");
+            fs::rename(&self.mountpoint_cache_path, &renamed_cache_path)?;
         }
 
-        let epoch_ns = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let renamed_cache_path = self.mountpoint_cache_path.with_file_name(format!(
-            "{}{}",
-            ManagedCacheDir::MOUNTPOINT_OLD_CACHE_DIR_PREFIX,
-            epoch_ns
-        ));
-
-        tracing::debug!(
-            cache_subdirectory = ?self.mountpoint_cache_path,
-            renamed_cache_subdirectory = ?renamed_cache_path,
-            "renaming the cache sub-directory to clean up in a background thread");
-        fs::rename(&self.mountpoint_cache_path, &renamed_cache_path)?;
-
+        let parent_path = self
+            .mountpoint_cache_path
+            .parent()
+            .expect("cache path must have a parent")
+            .to_owned();
+        let old_dirs = match fs::read_dir(&parent_path) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_dir()))
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(ManagedCacheDir::MOUNTPOINT_OLD_CACHE_DIR_PREFIX))
+                })
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>(),
+            Err(err) => {
+                tracing::warn!(
+                    ?parent_path,
+                    ?err,
+                    "failed to list cache directory, skipping stale cache dirs removal"
+                );
+                return Ok(());
+            }
+        };
+        if old_dirs.is_empty() {
+            return Ok(());
+        }
         std::thread::spawn(move || {
-            for attempt in 1..=ManagedCacheDir::MOUNTPOINT_OLD_CACHE_DIR_CLEANUP_MAX_RETRY {
-                match remove_dir_all_ignore_not_found(&renamed_cache_path) {
-                    Ok(()) => {
-                        tracing::debug!(
-                            attempt = attempt,
-                            renamed_cache_subdirectory = ?renamed_cache_path,
-                            "cache sub-directory removal complete");
-                        return;
-                    }
-                    Err(err) => {
-                        tracing::error!(
-                            attempt = attempt,
-                            renamed_cache_subdirectory = ?renamed_cache_path,
-                            error = ?err,
-                            "failed to remove cache sub-directory in background");
+            let old_dirs_count = old_dirs.len();
+            for old_dir in old_dirs {
+                tracing::debug!(
+                    stale_cache_dirs_count=old_dirs_count,
+                    stale_cache_dir = ?old_dir,
+                    "removing stale cache sub-directory");
+                for attempt in 1..=ManagedCacheDir::MOUNTPOINT_OLD_CACHE_DIR_CLEANUP_MAX_RETRY {
+                    match remove_dir_all_ignore_not_found(&old_dir) {
+                        Ok(()) => {
+                            tracing::debug!(
+                                attempt = attempt,
+                                old_cache_subdirectory = ?old_dir,
+                                "cache sub-directory removal complete");
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                attempt = attempt,
+                                old_cache_subdirectory = ?old_dir,
+                                error = ?err,
+                                "failed to remove cache sub-directory in background");
+                        }
                     }
                 }
             }
@@ -207,6 +240,7 @@ mod tests {
     use std::fs;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     const EXPECTED_DIR_MODE: u32 = 0o700;
@@ -367,43 +401,110 @@ mod tests {
         temp_dir.close().unwrap();
     }
 
+    /// Populate a cache directory with files spread across 256 hex-named subdirectories,
+    /// mimicking the layout Mountpoint uses for its local cache.
+    fn populate_cache_dir(cache_dir: &Path, num_files: usize) {
+        const NUM_PARTITIONS: usize = 256;
+        for n in 0..num_files {
+            let dir = cache_dir.join(format!("{:02x}", n % NUM_PARTITIONS));
+            fs::DirBuilder::new().recursive(true).create(&dir).unwrap();
+            fs::File::create(dir.join(format!("{n}.bin"))).unwrap();
+        }
+    }
+
+    /// Find all `old-mountpoint-cache.*` directories in the given parent path.
+    fn find_old_cache_dirs(parent_path: &Path) -> Vec<PathBuf> {
+        fs::read_dir(parent_path)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(ManagedCacheDir::MOUNTPOINT_OLD_CACHE_DIR_PREFIX))
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    /// Wait for all old cache directories to be removed by the background thread.
+    /// Panics if they are not removed within the timeout.
+    fn wait_for_old_cache_dirs_removal(parent_path: &Path, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = find_old_cache_dirs(parent_path);
+            if remaining.is_empty() {
+                return;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "old cache directories were not removed within {:?}: {:?}",
+                    timeout, remaining
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test_matrix([true, false])]
+    fn test_stale_old_cache_dirs_cleaned(cache_dir_exists: bool) {
+        let timeout = Duration::from_secs(10);
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Simulate leftover old cache dirs from previous crashed Mountpoint instances
+        let stale_dir_1 = temp_dir.path().join(format!(
+            "{}1000000000",
+            ManagedCacheDir::MOUNTPOINT_OLD_CACHE_DIR_PREFIX
+        ));
+        let stale_dir_2 = temp_dir.path().join(format!(
+            "{}2000000000",
+            ManagedCacheDir::MOUNTPOINT_OLD_CACHE_DIR_PREFIX
+        ));
+        let stale_dir_3 = temp_dir.path().join(format!(
+            "{}3000000000",
+            ManagedCacheDir::MOUNTPOINT_OLD_CACHE_DIR_PREFIX
+        ));
+        populate_cache_dir(&stale_dir_1, 5);
+        populate_cache_dir(&stale_dir_2, 10);
+        populate_cache_dir(&stale_dir_3, 3);
+
+        // Also create a current cache dir that will be renamed during cleanup
+        let cache_path = temp_dir.path().join("mountpoint-cache");
+        if cache_dir_exists {
+            fs::DirBuilder::new().create(&cache_path).unwrap();
+            fs::File::create(cache_path.join("file.txt")).unwrap();
+        }
+
+        let managed_dir = ManagedCacheDir::new_from_parent_with_cache_key(temp_dir.path(), None, true)
+            .expect("creating managed dir should succeed");
+
+        assert_dir_exists_with_permissions!(&cache_path);
+        assert_eq!(
+            0,
+            fs::read_dir(&cache_path).unwrap().count(),
+            "directory should be empty"
+        );
+
+        wait_for_old_cache_dirs_removal(temp_dir.path(), timeout);
+
+        assert!(!stale_dir_1.exists(), "stale dir 1 should be removed");
+        assert!(!stale_dir_2.exists(), "stale dir 2 should be removed");
+        assert!(!stale_dir_3.exists(), "stale dir 3 should be removed");
+
+        drop(managed_dir);
+        temp_dir.close().unwrap();
+    }
+
     // This test is disabled by default as it takes 10m+ to run.
     // #[test_matrix([50_000, 100_000, 250_000, 500_000])]
     #[allow(unused)]
     fn test_big_folder_cleaned_in_background(num_entries: usize) {
+        let timeout = Duration::from_secs(300);
         let temp_dir = tempfile::tempdir().unwrap();
         let expected_path = temp_dir.path().join("mountpoint-cache");
 
-        // Here we're trying to create a folder structure similar to how Mountpoint stores local-cache.
-        // Cache folder layout of a Mountpoint instance would look like:
-        //
-        // $ tree -L 3 --filelimit=256 /tmp/mp-cache/mountpoint-cache
-        // /tmp/mp-cache/mountpoint-cache
-        // └── V2
-        //     ├── 00 [418 entries exceeds filelimit, not opening dir]
-        //     ├── 01 [425 entries exceeds filelimit, not opening dir]
-        //     ├── 02 [410 entries exceeds filelimit, not opening dir]
-        //     ├── 03 [454 entries exceeds filelimit, not opening dir]
-        //     ├── 04 [415 entries exceeds filelimit, not opening dir]
-        //     ├── 05 [423 entries exceeds filelimit, not opening dir]
-        //     ├── 06 [404 entries exceeds filelimit, not opening dir]
-        //     ├── 07 [424 entries exceeds filelimit, not opening dir]
-        //     ├── 08 [423 entries exceeds filelimit, not opening dir]
-        //     ├── 09 [396 entries exceeds filelimit, not opening dir]
-        //     ├── 0a [456 entries exceeds filelimit, not opening dir]
-        //           ...
-        //           256 folders in total
         let start = std::time::Instant::now();
-        const NUM_PARTITIONS: usize = 256;
-        for n in 0..num_entries {
-            let dir = expected_path.join("V2").join(format!("{}", n % NUM_PARTITIONS));
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o775) // something that isn't the expected `0o700`
-                .create(&dir)
-                .unwrap();
-            fs::File::create(dir.join(format!("{n}.txt"))).unwrap();
-        }
+        populate_cache_dir(&expected_path, num_entries);
         println!(
             "created cache directory with {} entries in {:?}",
             num_entries,
@@ -424,39 +525,12 @@ mod tests {
         );
 
         // Ensure old cache directory exists...
-        let old_cache_dir = fs::read_dir(temp_dir.path())
-            .unwrap()
-            .filter_map(|res| match res {
-                Ok(entry) => {
-                    let path = entry.path();
-                    let file_name = path.file_name().unwrap().to_str().unwrap();
-                    if file_name.starts_with("old-mountpoint-cache.") {
-                        Some(entry)
-                    } else {
-                        None
-                    }
-                }
-                Err(_) => None,
-            })
-            .next()
-            .expect("missing old cache directory");
-        assert!(old_cache_dir.path().exists(), "old cache directory must exists");
-        // ... but it should be cleaned in the background, and eventually should disappear in 5 mins
-        for _ in 0..300 {
-            std::thread::sleep(Duration::from_secs(1));
-            if !old_cache_dir.path().exists() {
-                break;
-            }
-        }
-        assert!(
-            !old_cache_dir.path().exists(),
-            "old cache directory must disappear after 5 mins"
-        );
-        println!(
-            "old cache directory {:?} cleaned up in {:?}",
-            old_cache_dir.path(),
-            start.elapsed()
-        );
+        let old_cache_dirs = find_old_cache_dirs(temp_dir.path());
+        assert!(!old_cache_dirs.is_empty(), "missing old cache directory");
+
+        // ... but it should be cleaned in the background
+        wait_for_old_cache_dirs_removal(temp_dir.path(), timeout);
+        println!("old cache directories cleaned up in {:?}", start.elapsed());
 
         drop(managed_dir);
         assert_dir_does_not_exist!(&expected_path, "cache folder should be cleaned on drop");
